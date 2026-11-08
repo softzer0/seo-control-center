@@ -4,3 +4,5 @@
 *.ico binary
 *.ttf binary
 *.woff2 binary
+opscrew/secrets.sops.json text eol=lf
+opscrew/.sops.yaml text eol=lf
