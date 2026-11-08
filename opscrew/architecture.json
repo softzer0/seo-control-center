@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-11-08T07:13:12.565Z",
+  "generator": {
+    "tool": "opscrew",
+    "version": "0.2.5"
+  },
+  "facts": {
+    "name": "seocc",
+    "languages": [
+      "javascript",
+      "php"
+    ],
+    "packageManager": "none",
+    "frameworks": [],
+    "appKind": "fullstack",
+    "platformExport": {
+      "platform": "none",
+      "evidence": []
+    },
+    "build": {},
+    "port": 8080,
+    "runtimeVersions": {
+      "php": ">=8.5"
+    },
+    "envVars": [
+      {
+        "name": "APP_DEBUG",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "APP_ENV",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "APP_TIMEZONE",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "APP_URL",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "BACKUP_KEEP",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "CRON_INTERVAL_MINUTES",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "DATAFORSEO_RAW_RESPONSE_DAYS",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "DATAFORSEO_SANDBOX",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "DB_DATABASE",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false
+      },
+      {
+        "name": "DB_HOST",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false
+      },
+      {
+        "name": "DB_PASSWORD",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": true
+      },
+      {
+        "name": "DB_PORT",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "DB_USERNAME",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false
+      },
+      {
+        "name": "LOG_LEVEL",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "QUEUE_CRON_MAX_SECONDS",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "QUEUE_WORKER_SLOTS",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "SESSION_IDLE_MINUTES",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      },
+      {
+        "name": "SESSION_LIFETIME_HOURS",
+        "files": [
+          ".env.example"
+        ],
+        "clientExposed": false,
+        "secretLikely": false,
+        "hasDefault": true
+      }
+    ],
+    "services": [
+      {
+        "kind": "mysql",
+        "evidence": [
+          "dependency:ext-pdo_mysql"
+        ]
+      }
+    ],
+    "cronJobs": [
+      {
+        "schedule": "* * * * *",
+        "command": "php bin/cron.php",
+        "source": "cron.php"
+      }
+    ],
+    "files": {
+      "dir": "storage"
+    },
+    "docker": {},
+    "healthEndpoint": "/",
+    "webRoot": "public",
+    "monorepo": false,
+    "appDir": ".",
+    "git": {
+      "remoteUrl": "https://github.com/softzer0/seo-control-center.git",
+      "owner": "softzer0",
+      "repo": "seo-control-center",
+      "defaultBranch": "main",
+      "currentBranch": "main"
+    }
+  },
+  "summary": "seocc is a full-stack web app written in JavaScript and PHP. It listens on port 8080. Its health check is at `/`. It uses MySQL. It reads 18 environment variables.",
+  "risks": [
+    "There is no Dockerfile. OpsCrew will add one when it prepares the code (`opscrew adapt`)."
+  ],
+  "aiEnriched": false
+}

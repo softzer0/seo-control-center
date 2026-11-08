@@ -23,3 +23,5 @@ Thumbs.db
 /_originals-*/
 /seo-control-center-project-docs/
 /build/
+.opscrew/
+.terraform/
