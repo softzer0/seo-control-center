@@ -1,0 +1,5 @@
+# Written by OpsCrew: the age keys that can open opscrew/secrets.sops.json, the encrypted
+# recovery copy of what OpsCrew keeps on your computer for this app.
+creation_rules:
+  - path_regex: secrets\.sops\.json$
+    age: age17nkdrgrehwsjrpl5ctxfcntxagzhkjxfpdgc06lv0hzeu0kqee5q8x8q08
