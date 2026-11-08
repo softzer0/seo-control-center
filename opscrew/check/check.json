@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "intervalMinutes": 15,
+  "thresholds": {
+    "diskWarn": 85,
+    "diskHigh": 95,
+    "certDays": 14,
+    "tries": 3,
+    "retrySeconds": 30,
+    "timeoutSeconds": 10
+  },
+  "public": true,
+  "environments": [
+    {
+      "key": "seocc/prod",
+      "hosts": [
+        {
+          "hostname": "seocc.opscrew.dev",
+          "healthPath": "/"
+        }
+      ],
+      "server": {
+        "id": "hetzner-seocc",
+        "secret": "OPSCREW_CHECK_SERVER",
+        "via": "github"
+      }
+    }
+  ]
+}
