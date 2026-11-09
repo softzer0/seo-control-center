@@ -62,6 +62,8 @@ jobs:
             image="$(field image)"
             if [[ "$image" == sha256:* ]]; then image="${image:0:19}"; fi
             text="Deploys of $KEY are paused since $since: \`opscrew rollback\` pinned it to ${commit:0:7} (${image}). This run built ${GITHUB_SHA:0:7} but didn't deploy it. \`opscrew rollback --resume --deploy\` deploys the branch's latest commit."
+          elif [[ "$(field reason)" == rotation ]]; then
+            text="Deploys of $KEY are paused since $since for a credential rotation's window: \`opscrew rotate\` with its services, or with \`--undo\`, ends it."
           else
             text="Deploys of $KEY are paused since $since while a service moves between the app's servers; \`opscrew provision\` resumes them."
           fi
@@ -116,7 +118,7 @@ jobs:
           set -euo pipefail
           # The plan lists the names; the build reads the values as BuildKit secrets. Railpack
           # never sees a secret value here, only its name.
-          values=(--env RAILPACK_PHP_ROOT_DIR=/app/public --env RAILPACK_PHP_EXTENSIONS=pdo_mysql)
+          values=(--env RAILPACK_PHP_ROOT_DIR=/app/public --env RAILPACK_PHP_EXTENSIONS=intl,pdo_mysql,zip)
           while IFS= read -r line; do
             [[ -z "$line" || "$line" == \#* ]] && continue
             values+=(--env "$line")
@@ -152,7 +154,7 @@ jobs:
           # The frontend reads every value the plan lists as a secret, the runtime version too.
           secrets: |
             RAILPACK_PHP_ROOT_DIR=/app/public
-            RAILPACK_PHP_EXTENSIONS=pdo_mysql
+            RAILPACK_PHP_EXTENSIONS=intl,pdo_mysql,zip
             ${{ secrets.OPSCREW_BUILD_ENV }}
             ${{ secrets.OPSCREW_BUILD_SECRETS }}
           cache-from: type=gha,scope=railpack
@@ -341,9 +343,9 @@ jobs:
         run: |
           set -euo pipefail
           ssh_opts=(-i ~/.ssh/opscrew -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20)
-          hold="$(ssh "${ssh_opts[@]}" "deploy@${HOST}" 'if [ -f /srv/apps/seocc/.snapshots/.held ]; then echo held; fi')"
-          if [[ "$hold" == held ]]; then
-            echo "::error::OpsCrew changed nothing on the server: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app's folder as the deploy user, then try again."
+          hold="$(ssh "${ssh_opts[@]}" "deploy@${HOST}" 'if [ -f /srv/apps/seocc/.snapshots/.held ]; then echo held $(cat /srv/apps/seocc/.snapshots/.held); fi')"
+          if [[ "$hold" == held* ]]; then
+            case "$hold" in "held rotation "*) printf '::error::OpsCrew changed nothing on the server: a credential rotation holds the app (the rotation of the plan %s), so its services may have new values the app does not use yet: finish the rotation with opscrew rotate, or put the old values back with opscrew rotate --undo, then try again.\n' "${hold#held rotation }" ;; *) printf '::error::OpsCrew changed nothing on the server: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app'\''s folder as the deploy user, then try again.\n' ;; esac
             exit 1
           fi
           ssh "${ssh_opts[@]}" "deploy@${HOST}" 'mkdir -p /srv/apps/seocc'
@@ -359,7 +361,7 @@ jobs:
           ssh "${ssh_opts[@]}" "deploy@${HOST}" 'umask 077 && cat > /srv/apps/seocc/snapshot.sh.new && mv -f /srv/apps/seocc/snapshot.sh.new /srv/apps/seocc/snapshot.sh' <<'SNAPSHOT'
           # OpsCrew's snapshots of seocc's data on the app's server, generated from opscrew/plan.yaml; each deploy uploads it.
           #   sh snapshot.sh take <manual|release|scheduled> [--skip <service>]... [--stop <service>]... [--id <id>] [--version sha256:<hex>]
-          #   sh snapshot.sh restore <id> [--only <service>]
+          #   sh snapshot.sh restore <id> [--only <service>] [--no-wait <service>]...
           #   sh snapshot.sh hold
           #   sh snapshot.sh resume
           #   sh snapshot.sh list
@@ -429,7 +431,10 @@ jobs:
             done
           }
           snapshot_start() {
-            docker compose up -d --no-deps --no-recreate --wait "$1" >> .snapshots/snapshot.log 2>&1
+            case " ${SNAPSHOT_NO_WAIT:-} " in
+              *" $1 "*) docker compose up -d --no-deps --no-recreate "$1" >> .snapshots/snapshot.log 2>&1 ;;
+              *) docker compose up -d --no-deps --no-recreate --wait "$1" >> .snapshots/snapshot.log 2>&1 ;;
+            esac
           }
           snapshot_tar() {
             _ran="$(docker compose ps -q "$1")"
@@ -511,7 +516,10 @@ jobs:
                   _about_file="$(part_file "$_about_part")"
                   _about_image="$(part_image "$_about_part")"
                   if [ -n "$_about_image" ]; then _about_image=",\"image\":\"$_about_image\""; fi
-                  printf '{"name":"%s","kind":"%s","file":"%s","size":%s%s}' "$_about_part" "$(part_kind "$_about_part")" "$_about_file" "$(wc -c < "$_about_folder/$_about_file" | tr -d ' ')" "$_about_image" ;;
+                  _about_generation=""
+                  case " $SNAPSHOT_ONLINE " in *" $_about_part "*) ;; *) if [ -f .snapshots/generations ]; then _about_generation="$(awk -v s="$_about_part" '$1 == s && $2 ~ /^[1-9][0-9]*$/ { g = $2 } END { if (g != "") print g }' .snapshots/generations)"; fi ;; esac
+                  if [ -n "$_about_generation" ]; then _about_generation=",\"generation\":$_about_generation"; fi
+                  printf '{"name":"%s","kind":"%s","file":"%s","size":%s%s%s}' "$_about_part" "$(part_kind "$_about_part")" "$_about_file" "$(wc -c < "$_about_folder/$_about_file" | tr -d ' ')" "$_about_image" "$_about_generation" ;;
                 *) printf '{"name":"%s","kind":"%s","skipped":true}' "$_about_part" "$(part_kind "$_about_part")" ;;
               esac
             done
@@ -562,7 +570,7 @@ jobs:
             done
           }
           snapshot_usage() {
-            echo 'Usage: sh snapshot.sh take <manual|release|scheduled> [--skip <service>]... [--stop <service>]... [--id <id>] [--version sha256:<hex>] | restore <id> [--only <service>] | hold | resume | list | delete <id> | offsite <id>' >&2
+            echo 'Usage: sh snapshot.sh take <manual|release|scheduled> [--skip <service>]... [--stop <service>]... [--id <id>] [--version sha256:<hex>] | restore <id> [--only <service>] [--no-wait <service>]... | hold | resume | list | delete <id> | offsite <id>' >&2
           }
           snapshot_id() {
             case "$1" in
@@ -579,9 +587,15 @@ jobs:
             while [ -e .snapshots/"$_new" ]; do sleep 1; _new="$(date -u +%Y%m%dT%H%M%SZ)"; done
             echo "$_new"
           }
+          snapshot_rotation_held() {
+            _holder="held $(cat .snapshots/.held 2> /dev/null || true)"
+            case "$_holder" in "held rotation "*) printf '%sa credential rotation holds the app (the rotation of the plan %s), so its services may have new values the app does not use yet: finish the rotation with opscrew rotate, or put the old values back with opscrew rotate --undo, then try again.\n' "$1" "${_holder#held rotation }" >&2; return 0 ;; esac
+            return 1
+          }
           snapshot_cmd_take() {
             _kind="${1:-}"
             case "$_kind" in manual | release | scheduled) shift ;; *) snapshot_usage; return 1 ;; esac
+            if [ "$_kind" = manual ] && snapshot_rotation_held 'OpsCrew took no snapshot: '; then return 1; fi
             case "$_kind" in
               release) _stop='' ;;
               scheduled) _stop='' ;;
@@ -664,12 +678,17 @@ jobs:
             _id="$1"
             shift
             snapshot_id "$_id" || return 1
-            _only=""
-            if [ "$#" -gt 0 ]; then
-              if [ "$#" -ne 2 ] || [ "$1" != --only ]; then snapshot_usage; return 1; fi
+            _only=""; _nowait=""
+            while [ "$#" -gt 0 ]; do
+              [ "$#" -ge 2 ] || { snapshot_usage; return 1; }
               snapshot_known "$2" || return 1
-              _only="$2"
-            fi
+              case "$1" in
+                --only) [ -z "$_only" ] || { snapshot_usage; return 1; }; _only="$2" ;;
+                --no-wait) _nowait="$_nowait $2" ;;
+                *) snapshot_usage; return 1 ;;
+              esac
+              shift 2
+            done
             if [ ! -f .restore-snapshot ]; then
               echo 'A restore needs its one-time approval on this server (.restore-snapshot), which opscrew restore writes once you approve it, so nothing was changed. Run opscrew restore.' >&2
               return 1
@@ -686,6 +705,7 @@ jobs:
               echo 'The one-time approval of this restore expired before it started, so nothing was changed. Run opscrew restore again.' >&2
               return 1
             fi
+            if snapshot_rotation_held 'OpsCrew changed nothing: '; then return 1; fi
             if ! snapshot_complete "$_id"; then
               printf 'The snapshot %s is not complete on this server, so nothing was changed.\n' "$_id" >&2
               return 1
@@ -725,11 +745,14 @@ jobs:
               return 1
             fi
             echo "saved $_saved"
+            SNAPSHOT_NO_WAIT="$_nowait"
             if snapshot_restore "$_id" $_parts; then
+              SNAPSHOT_NO_WAIT=""
               if [ -z "$_held" ]; then docker compose start app $(cat .processes.previous 2> /dev/null || true); fi
               printf 'OpsCrew restored the snapshot %s. The data from just before the restore is the snapshot %s.\n' "$_id" "$_saved" >&2
               return 0
             fi
+            SNAPSHOT_NO_WAIT=""
             if snapshot_restore "$_saved" $_parts; then
               if [ -z "$_held" ]; then docker compose start app $(cat .processes.previous 2> /dev/null || true); fi
               printf 'Restoring the snapshot %s failed, so OpsCrew put the data back as it was before the restore (the snapshot %s)%s: nothing changed. The output of the copies and restores stays on the server in %s/.snapshots/snapshot.log (it can quote data, so it is not printed here).\n' "$_id" "$_saved" "$_starts" "$APPS_DIR"/seocc >&2
@@ -739,6 +762,7 @@ jobs:
             return 5
           }
           snapshot_cmd_hold() {
+            if snapshot_rotation_held 'OpsCrew changed nothing: '; then return 1; fi
             (umask 077 && mkdir -p .snapshots && : > .snapshots/.held)
             if [ -n "$(docker compose ps -q app)" ]; then
               for service in cron; do
@@ -749,6 +773,7 @@ jobs:
             docker compose stop app cron
           }
           snapshot_cmd_resume() {
+            if snapshot_rotation_held 'OpsCrew changed nothing: '; then return 1; fi
             docker compose start app $(cat .processes.previous 2> /dev/null || true)
             edge exec -T kamal-proxy kamal-proxy resume seocc < /dev/null > /dev/null 2>&1 || true
             rm -f .snapshots/.held
@@ -817,7 +842,7 @@ jobs:
           cd "$APPS_DIR"/seocc
           exec 7> .start.lock
           flock 7
-          if [ -f .snapshots/.held ]; then echo '::error::OpsCrew changed nothing on the server: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app'\''s folder as the deploy user, then try again.' >&2; exit 1; fi
+          if [ -f .snapshots/.held ]; then held="held $(cat .snapshots/.held)"; case "$held" in "held rotation "*) printf '::error::OpsCrew changed nothing on the server: a credential rotation holds the app (the rotation of the plan %s), so its services may have new values the app does not use yet: finish the rotation with opscrew rotate, or put the old values back with opscrew rotate --undo, then try again.\n' "${held#held rotation }" ;; *) printf '::error::OpsCrew changed nothing on the server: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app'\''s folder as the deploy user, then try again.\n' ;; esac >&2; exit 1; fi
           echo started > .start.outcome
           export APP_IMAGE="$1"
           RUN_IMAGE="$1"
@@ -1065,7 +1090,7 @@ jobs:
           cd "$APPS_DIR"/seocc
           exec 7> .start.lock
           flock -w 900 7 || { echo '::error::The start script of this run is still running on the server after 15 minutes, so the rollback step changed nothing. Check the app on the server (opscrew/RUNBOOK.md has the SSH command), then run the deploy or opscrew rollback again.' >&2; exit 1; }
-          if [ -f .snapshots/.held ]; then echo held; exit 0; fi
+          if [ -f .snapshots/.held ]; then echo held $(cat .snapshots/.held); exit 0; fi
           RUN_IMAGE="$1"
           keep_failed() {
             (
@@ -1182,7 +1207,7 @@ jobs:
             outcome="$(ssh "${ssh_opts[@]}" "deploy@${HOST}" sh -s -- "$IMAGE" < "$RUNNER_TEMP/rollback.sh")"
           fi
           case "$MODE:$outcome" in
-            *:held) echo "::error::This run stopped before changing anything: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app's folder as the deploy user, then try again." ;;
+            *:held*) case "$outcome" in "held rotation "*) printf '::error::This run stopped before changing anything: a credential rotation holds the app (the rotation of the plan %s), so its services may have new values the app does not use yet: finish the rotation with opscrew rotate, or put the old values back with opscrew rotate --undo, then try again.\n' "${outcome#held rotation }" ;; *) printf '::error::This run stopped before changing anything: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app'\''s folder as the deploy user, then try again.\n' ;; esac ;;
             rollback:restored)
               echo "::error::The rollback failed: the earlier version did not pass its checks, so OpsCrew put back the version that ran before the rollback." ;;
             rollback:unchanged)

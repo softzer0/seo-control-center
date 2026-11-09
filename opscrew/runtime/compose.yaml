@@ -75,6 +75,10 @@ services:
   mysql:
     image: mysql:8.4@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
     restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - '{ [ -f /tmp/opscrew-root-password ] || (umask 077 && printf %s "$$MYSQL_ROOT_PASSWORD" > /tmp/opscrew-root-password); } && exec docker-entrypoint.sh mysqld'
     env_file:
       - mysql.env
     volumes:
