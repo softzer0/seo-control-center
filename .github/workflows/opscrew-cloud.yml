@@ -1,0 +1,769 @@
+# Written by app.opscrew.dev. Runs OpsCrew's CLI in your Actions when the control plane asks.
+# It reads the secrets named OPSCREW_CLOUD_*; the control plane can't read them.
+name: OpsCrew Cloud
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "What to run"
+        required: true
+        type: choice
+        options: [checks, versions, plan, apply, logs]
+      request:
+        description: "The control plane's request"
+        required: true
+        type: string
+      targets:
+        description: "app:env pairs"
+        required: false
+        type: string
+        default: ""
+      plan_run:
+        description: "The plan's run (apply)"
+        required: false
+        type: string
+        default: ""
+      hash:
+        description: "The approved plan's hash (apply)"
+        required: false
+        type: string
+        default: ""
+      service:
+        description: "The part of the app (logs)"
+        required: false
+        type: string
+        default: ""
+      since:
+        description: "Lines of the last 15m, 2h, 3d (logs)"
+        required: false
+        type: string
+        default: ""
+      tail:
+        description: "How many of the latest lines (logs)"
+        required: false
+        type: string
+        default: ""
+permissions: {}
+concurrency:
+  group: opscrew-cloud-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  checks:
+    if: inputs.job == 'checks'
+    runs-on: ubuntu-slim
+    environment: opscrew-cloud
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check the inputs
+        id: validate
+        env:
+          JOB: ${{ inputs.job }}
+          REQUEST: ${{ inputs.request }}
+          TARGETS: ${{ inputs.targets }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+          HASH: ${{ inputs.hash }}
+          SERVICE: ${{ inputs.service }}
+          SINCE: ${{ inputs.since }}
+          TAIL: ${{ inputs.tail }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          targets='^((_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}(,(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}){0,19})?$'
+          request='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          [[ "$JOB" == checks ]] || fail "job must be checks."
+          [[ "$REQUEST" =~ $request ]] || fail "request must be the control plane's request id (a UUID)."
+          [[ "$TARGETS" =~ $targets ]] || fail "targets must be at most 20 app:env pairs."
+          [[ -z "$PLAN_RUN" ]] || fail "plan_run is only for apply."
+          [[ -z "$HASH" ]] || fail "hash is only for apply."
+          [[ -z "$SERVICE$SINCE$TAIL" ]] || fail "service, since and tail are only for logs."
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "request=$REQUEST" >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+      - name: Restore OpsCrew's files from the recovery copy
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/opscrew-age.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$OPSCREW_CLOUD_AGE_KEY" > "$key")
+          chmod 600 "$key"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            npx -y opscrew@0.2.9 secrets restore --app "$app_flag" --env "$env" --key-file "$key" --use-copy || echo "::warning::The recovery copy of ${app}:${env} could not be restored."
+          done
+      - name: Check each target for drift
+        env:
+          TARGETS: ${{ steps.validate.outputs.targets }}
+          HCLOUD_TOKEN: ${{ secrets.OPSCREW_CLOUD_HCLOUD_TOKEN }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.OPSCREW_CLOUD_DIGITALOCEAN_TOKEN }}
+          CNTB_OAUTH2_CLIENT_ID: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_ID }}
+          CNTB_OAUTH2_CLIENT_SECRET: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_SECRET }}
+          CNTB_OAUTH2_USER: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_USER }}
+          CNTB_OAUTH2_PASS: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_PASS }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OPSCREW_CLOUD_CLOUDFLARE_API_TOKEN }}
+          PORTAINER_API_KEY: ${{ secrets.OPSCREW_CLOUD_PORTAINER_API_KEY }}
+          OPSCREW_HOSTING_URL: ${{ secrets.OPSCREW_CLOUD_HOSTING_URL }}
+          OPSCREW_HOSTING_USER: ${{ secrets.OPSCREW_CLOUD_HOSTING_USER }}
+          OPSCREW_HOSTING_TOKEN: ${{ secrets.OPSCREW_CLOUD_HOSTING_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out/drift"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            code=0
+            npx -y opscrew@0.2.9 drift --json --app "$app_flag" --env "$env" > "$RUNNER_TEMP/out/drift/${app}__${env}.json" || code=$?
+            echo "drift/${app}__${env}.json $code" >> "$RUNNER_TEMP/exits"
+          done
+      - name: Scan the repository
+        run: |
+          set -euo pipefail
+          code=0
+          npx -y opscrew@0.2.9 scan --json > "$RUNNER_TEMP/out/scan.json" || code=$?
+          echo "scan.json $code" >> "$RUNNER_TEMP/exits"
+      - name: Write meta.json
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          JOB: ${{ steps.validate.outputs.job }}
+          REQUEST: ${{ steps.validate.outputs.request }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SCRIPT: |
+            import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+            const temp = process.env.RUNNER_TEMP;
+            const exits = {};
+            if (existsSync(`${temp}/exits`)) {
+              for (const line of readFileSync(`${temp}/exits`, "utf8").split("\n")) {
+                const [file, code] = line.split(" ");
+                if (file) exits[file] = Number(code);
+              }
+            }
+            const meta = {
+              request: process.env.REQUEST,
+              job: process.env.JOB,
+              cli: "0.2.9",
+              workflowSha: process.env.WORKFLOW_SHA,
+              exits,
+            };
+            mkdirSync(`${temp}/out`, { recursive: true });
+            writeFileSync(`${temp}/out/meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+        run: node --input-type=module -e "$SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        with:
+          name: opscrew-cloud-checks
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+  versions:
+    if: inputs.job == 'versions'
+    runs-on: ubuntu-slim
+    environment: opscrew-cloud
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check the inputs
+        id: validate
+        env:
+          JOB: ${{ inputs.job }}
+          REQUEST: ${{ inputs.request }}
+          TARGETS: ${{ inputs.targets }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+          HASH: ${{ inputs.hash }}
+          SERVICE: ${{ inputs.service }}
+          SINCE: ${{ inputs.since }}
+          TAIL: ${{ inputs.tail }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          targets='^(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}(,(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}){0,19}$'
+          request='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          [[ "$JOB" == versions ]] || fail "job must be versions."
+          [[ "$REQUEST" =~ $request ]] || fail "request must be the control plane's request id (a UUID)."
+          [[ "$TARGETS" =~ $targets ]] || fail "targets must be 1 to 20 app:env pairs."
+          [[ -z "$PLAN_RUN" ]] || fail "plan_run is only for apply."
+          [[ -z "$HASH" ]] || fail "hash is only for apply."
+          [[ -z "$SERVICE$SINCE$TAIL" ]] || fail "service, since and tail are only for logs."
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "request=$REQUEST" >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: List the images kept for a rollback
+        env:
+          TARGETS: ${{ steps.validate.outputs.targets }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SCRIPT: |
+            const [app, env] = process.argv.slice(1);
+            const repository = process.env.GITHUB_REPOSITORY.toLowerCase();
+            const name = app === "_" ? repository : `${repository}/${app}`;
+            const registry = "https://ghcr.io";
+            const basic = Buffer.from(`x:${process.env.GITHUB_TOKEN}`).toString("base64");
+            const login = await fetch(`${registry}/token?service=ghcr.io&scope=repository:${name}:pull`, {
+              headers: { authorization: `Basic ${basic}` },
+            });
+            if (!login.ok) throw new Error(`ghcr.io gave no read token for ${name} (HTTP ${login.status}).`);
+            const headers = { authorization: `Bearer ${(await login.json()).token}` };
+            const listed = await fetch(`${registry}/v2/${name}/tags/list?n=1000`, { headers });
+            if (!listed.ok) throw new Error(`ghcr.io listed no tags for ${name} (HTTP ${listed.status}).`);
+            const tags = (await listed.json()).tags ?? [];
+            const labels = [`opscrew-${env}`, `opscrew-${env}-previous`].filter((tag) => tags.includes(tag));
+            const accept = [
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+            ].join(", ");
+            const digestOf = async (tag) => {
+              const head = await fetch(`${registry}/v2/${name}/manifests/${tag}`, {
+                method: "HEAD",
+                headers: { ...headers, accept },
+              });
+              const digest = head.headers.get("docker-content-digest");
+              if (!head.ok || digest === null) {
+                throw new Error(`ghcr.io gave no digest for ${name}:${tag} (HTTP ${head.status}).`);
+              }
+              return digest;
+            };
+            const digests = new Map();
+            for (const label of labels) digests.set(label, await digestOf(label));
+            const wanted = new Set(digests.values());
+            const commitTags = new Map();
+            for (const tag of tags.filter((t) => /^[0-9a-f]{40}(-[a-z0-9][a-z0-9-]*)?$/.test(t))) {
+              if (commitTags.size === wanted.size) break;
+              const digest = await digestOf(tag);
+              if (wanted.has(digest) && !commitTags.has(digest)) commitTags.set(digest, tag);
+            }
+            const platformsOf = async (digest) => {
+              try {
+                const read = await fetch(`${registry}/v2/${name}/manifests/${digest}`, {
+                  headers: { ...headers, accept },
+                });
+                if (!read.ok) return null;
+                const manifest = await read.json();
+                if (!Array.isArray(manifest.manifests)) {
+                  const config = await fetch(`${registry}/v2/${name}/blobs/${manifest.config.digest}`, {
+                    headers,
+                  });
+                  if (!config.ok) return null;
+                  const { architecture } = await config.json();
+                  return typeof architecture === "string" ? [architecture] : [];
+                }
+                const images = manifest.manifests.filter(
+                  (m) => m.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest",
+                );
+                const architectures = images.map((m) => m.platform?.architecture);
+                return [...new Set(architectures.filter((a) => typeof a === "string"))];
+              } catch {
+                return null;
+              }
+            };
+            const entries = [];
+            for (const digest of wanted) {
+              const on = labels.filter((label) => digests.get(label) === digest);
+              const platforms = await platformsOf(digest);
+              entries.push({ tag: commitTags.get(digest) ?? on[0], digest, labels: on, platforms });
+            }
+            const image = `ghcr.io/${name}`;
+            process.stdout.write(`${JSON.stringify({ image, tags: entries }, null, 2)}\n`);
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out/versions"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            code=0
+            node --input-type=module -e "$SCRIPT" "$app" "$env" > "$RUNNER_TEMP/out/versions/${app}__${env}.json" || code=$?
+            echo "versions/${app}__${env}.json $code" >> "$RUNNER_TEMP/exits"
+          done
+      - name: Write meta.json
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          JOB: ${{ steps.validate.outputs.job }}
+          REQUEST: ${{ steps.validate.outputs.request }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SCRIPT: |
+            import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+            const temp = process.env.RUNNER_TEMP;
+            const exits = {};
+            if (existsSync(`${temp}/exits`)) {
+              for (const line of readFileSync(`${temp}/exits`, "utf8").split("\n")) {
+                const [file, code] = line.split(" ");
+                if (file) exits[file] = Number(code);
+              }
+            }
+            const meta = {
+              request: process.env.REQUEST,
+              job: process.env.JOB,
+              cli: "0.2.9",
+              workflowSha: process.env.WORKFLOW_SHA,
+              exits,
+            };
+            mkdirSync(`${temp}/out`, { recursive: true });
+            writeFileSync(`${temp}/out/meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+        run: node --input-type=module -e "$SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        with:
+          name: opscrew-cloud-versions
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+  plan:
+    if: inputs.job == 'plan'
+    runs-on: ubuntu-latest
+    environment: opscrew-cloud
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check the inputs
+        id: validate
+        env:
+          JOB: ${{ inputs.job }}
+          REQUEST: ${{ inputs.request }}
+          TARGETS: ${{ inputs.targets }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+          HASH: ${{ inputs.hash }}
+          SERVICE: ${{ inputs.service }}
+          SINCE: ${{ inputs.since }}
+          TAIL: ${{ inputs.tail }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          targets='^(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}$'
+          request='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          [[ "$JOB" == plan ]] || fail "job must be plan."
+          [[ "$REQUEST" =~ $request ]] || fail "request must be the control plane's request id (a UUID)."
+          [[ "$TARGETS" =~ $targets ]] || fail "targets must be exactly one app:env pair."
+          [[ -z "$PLAN_RUN" ]] || fail "plan_run is only for apply."
+          [[ -z "$HASH" ]] || fail "hash is only for apply."
+          [[ -z "$SERVICE$SINCE$TAIL" ]] || fail "service, since and tail are only for logs."
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "request=$REQUEST" >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+      - name: Restore OpsCrew's files from the recovery copy
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/opscrew-age.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$OPSCREW_CLOUD_AGE_KEY" > "$key")
+          chmod 600 "$key"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            npx -y opscrew@0.2.9 secrets restore --app "$app_flag" --env "$env" --key-file "$key" --use-copy
+          done
+      - name: Plan the change
+        env:
+          TARGETS: ${{ steps.validate.outputs.targets }}
+          HCLOUD_TOKEN: ${{ secrets.OPSCREW_CLOUD_HCLOUD_TOKEN }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.OPSCREW_CLOUD_DIGITALOCEAN_TOKEN }}
+          CNTB_OAUTH2_CLIENT_ID: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_ID }}
+          CNTB_OAUTH2_CLIENT_SECRET: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_SECRET }}
+          CNTB_OAUTH2_USER: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_USER }}
+          CNTB_OAUTH2_PASS: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_PASS }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OPSCREW_CLOUD_CLOUDFLARE_API_TOKEN }}
+          PORTAINER_API_KEY: ${{ secrets.OPSCREW_CLOUD_PORTAINER_API_KEY }}
+          OPSCREW_HOSTING_URL: ${{ secrets.OPSCREW_CLOUD_HOSTING_URL }}
+          OPSCREW_HOSTING_USER: ${{ secrets.OPSCREW_CLOUD_HOSTING_USER }}
+          OPSCREW_HOSTING_TOKEN: ${{ secrets.OPSCREW_CLOUD_HOSTING_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pair="$TARGETS"
+          app="${pair%%:*}"
+          env="${pair#*:}"
+          if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+          code=0
+          npx -y opscrew@0.2.9 provision --app "$app_flag" --env "$env" --plan-only --no-push > "$RUNNER_TEMP/out/plan.txt" 2>&1 || code=$?
+          echo "plan.txt $code" >> "$RUNNER_TEMP/exits"
+          exit "$code"
+      - name: Encrypt the saved plans
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          pair="$TARGETS"
+          app="${pair%%:*}"
+          env="${pair#*:}"
+          if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+          plans=.opscrew
+          if [[ "$app" != _ ]]; then plans="$plans/apps/$app"; fi
+          if [[ "$env" != prod ]]; then plans="$plans/environments/$env"; fi
+          plans="$plans/plans"
+          if [[ ! -d "$plans" ]]; then echo "No saved plan: nothing to change."; exit 0; fi
+          tarball="$RUNNER_TEMP/plans.tar.gz"
+          trap 'rm -f "$tarball"' EXIT
+          tar -czf "$tarball" -C "$plans" .
+          mkdir -p "$RUNNER_TEMP/saved"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:OPSCREW_CLOUD_AGE_KEY -in "$tarball" -out "$RUNNER_TEMP/saved/plans.tar.gz.enc"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: opscrew-cloud-saved-plans
+          path: ${{ runner.temp }}/saved/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Write meta.json
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          JOB: ${{ steps.validate.outputs.job }}
+          REQUEST: ${{ steps.validate.outputs.request }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SCRIPT: |
+            import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+            const temp = process.env.RUNNER_TEMP;
+            const exits = {};
+            if (existsSync(`${temp}/exits`)) {
+              for (const line of readFileSync(`${temp}/exits`, "utf8").split("\n")) {
+                const [file, code] = line.split(" ");
+                if (file) exits[file] = Number(code);
+              }
+            }
+            const meta = {
+              request: process.env.REQUEST,
+              job: process.env.JOB,
+              cli: "0.2.9",
+              workflowSha: process.env.WORKFLOW_SHA,
+              exits,
+            };
+            mkdirSync(`${temp}/out`, { recursive: true });
+            writeFileSync(`${temp}/out/meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+        run: node --input-type=module -e "$SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        with:
+          name: opscrew-cloud-plan
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+  apply:
+    if: inputs.job == 'apply'
+    runs-on: ubuntu-latest
+    environment: opscrew-cloud
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check the inputs
+        id: validate
+        env:
+          JOB: ${{ inputs.job }}
+          REQUEST: ${{ inputs.request }}
+          TARGETS: ${{ inputs.targets }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+          HASH: ${{ inputs.hash }}
+          SERVICE: ${{ inputs.service }}
+          SINCE: ${{ inputs.since }}
+          TAIL: ${{ inputs.tail }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          targets='^(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}$'
+          request='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          plan_run='^[0-9]{1,20}$'
+          hash='^[0-9a-f]{64}$'
+          [[ "$JOB" == apply ]] || fail "job must be apply."
+          [[ "$REQUEST" =~ $request ]] || fail "request must be the control plane's request id (a UUID)."
+          [[ "$TARGETS" =~ $targets ]] || fail "targets must be exactly one app:env pair."
+          [[ "$PLAN_RUN" =~ $plan_run ]] || fail "plan_run must be the plan's run id."
+          [[ "$HASH" =~ $hash ]] || fail "hash must be the approved plan's SHA-256 (64 lower-case hex digits)."
+          [[ -z "$SERVICE$SINCE$TAIL" ]] || fail "service, since and tail are only for logs."
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "request=$REQUEST" >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "plan_run=$PLAN_RUN" >> "$GITHUB_OUTPUT"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.OPSCREW_CLOUD_APPLY_GITHUB_TOKEN }}
+          persist-credentials: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+      - name: Restore OpsCrew's files from the recovery copy
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/opscrew-age.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$OPSCREW_CLOUD_AGE_KEY" > "$key")
+          chmod 600 "$key"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            npx -y opscrew@0.2.9 secrets restore --app "$app_flag" --env "$env" --key-file "$key" --use-copy
+          done
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: opscrew-cloud-saved-plans
+          path: ${{ runner.temp }}/plan
+          run-id: ${{ steps.validate.outputs.plan_run }}
+          github-token: ${{ github.token }}
+      - name: Decrypt the saved plans
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          pair="$TARGETS"
+          app="${pair%%:*}"
+          env="${pair#*:}"
+          if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+          plans=.opscrew
+          if [[ "$app" != _ ]]; then plans="$plans/apps/$app"; fi
+          if [[ "$env" != prod ]]; then plans="$plans/environments/$env"; fi
+          plans="$plans/plans"
+          mkdir -p "$plans"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:OPSCREW_CLOUD_AGE_KEY -in "$RUNNER_TEMP/plan/plans.tar.gz.enc" | tar -xzf - -C "$plans"
+      - name: Apply the approved plan
+        env:
+          TARGETS: ${{ steps.validate.outputs.targets }}
+          HASH: ${{ steps.validate.outputs.hash }}
+          HCLOUD_TOKEN: ${{ secrets.OPSCREW_CLOUD_APPLY_HCLOUD_TOKEN }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.OPSCREW_CLOUD_APPLY_DIGITALOCEAN_TOKEN }}
+          CNTB_OAUTH2_CLIENT_ID: ${{ secrets.OPSCREW_CLOUD_APPLY_CNTB_OAUTH2_CLIENT_ID }}
+          CNTB_OAUTH2_CLIENT_SECRET: ${{ secrets.OPSCREW_CLOUD_APPLY_CNTB_OAUTH2_CLIENT_SECRET }}
+          CNTB_OAUTH2_USER: ${{ secrets.OPSCREW_CLOUD_APPLY_CNTB_OAUTH2_USER }}
+          CNTB_OAUTH2_PASS: ${{ secrets.OPSCREW_CLOUD_APPLY_CNTB_OAUTH2_PASS }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OPSCREW_CLOUD_APPLY_CLOUDFLARE_API_TOKEN }}
+          PORTAINER_API_KEY: ${{ secrets.OPSCREW_CLOUD_APPLY_PORTAINER_API_KEY }}
+          OPSCREW_HOSTING_URL: ${{ secrets.OPSCREW_CLOUD_APPLY_HOSTING_URL }}
+          OPSCREW_HOSTING_USER: ${{ secrets.OPSCREW_CLOUD_APPLY_HOSTING_USER }}
+          OPSCREW_HOSTING_TOKEN: ${{ secrets.OPSCREW_CLOUD_APPLY_HOSTING_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.OPSCREW_CLOUD_APPLY_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pair="$TARGETS"
+          app="${pair%%:*}"
+          env="${pair#*:}"
+          if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          code=0
+          npx -y opscrew@0.2.9 provision --app "$app_flag" --env "$env" --approve "$HASH" --yes > "$RUNNER_TEMP/out/apply.txt" 2>&1 || code=$?
+          echo "apply.txt $code" >> "$RUNNER_TEMP/exits"
+          exit "$code"
+      - name: Write meta.json
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          JOB: ${{ steps.validate.outputs.job }}
+          REQUEST: ${{ steps.validate.outputs.request }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SCRIPT: |
+            import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+            const temp = process.env.RUNNER_TEMP;
+            const exits = {};
+            if (existsSync(`${temp}/exits`)) {
+              for (const line of readFileSync(`${temp}/exits`, "utf8").split("\n")) {
+                const [file, code] = line.split(" ");
+                if (file) exits[file] = Number(code);
+              }
+            }
+            const meta = {
+              request: process.env.REQUEST,
+              job: process.env.JOB,
+              cli: "0.2.9",
+              workflowSha: process.env.WORKFLOW_SHA,
+              exits,
+            };
+            mkdirSync(`${temp}/out`, { recursive: true });
+            writeFileSync(`${temp}/out/meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+        run: node --input-type=module -e "$SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        with:
+          name: opscrew-cloud-apply
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
+  logs:
+    if: inputs.job == 'logs'
+    runs-on: ubuntu-slim
+    environment: opscrew-cloud
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check the inputs
+        id: validate
+        env:
+          JOB: ${{ inputs.job }}
+          REQUEST: ${{ inputs.request }}
+          TARGETS: ${{ inputs.targets }}
+          PLAN_RUN: ${{ inputs.plan_run }}
+          HASH: ${{ inputs.hash }}
+          SERVICE: ${{ inputs.service }}
+          SINCE: ${{ inputs.since }}
+          TAIL: ${{ inputs.tail }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          targets='^(_|[a-z0-9][a-z0-9-]{0,62}):[a-z0-9][a-z0-9-]{0,62}$'
+          request='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          service='^([a-z0-9][a-z0-9-]{0,62})?$'
+          since='^([0-9]+[smhd])?$'
+          tail='^([1-9][0-9]{0,2}|1[0-9]{3}|2000)?$'
+          [[ "$JOB" == logs ]] || fail "job must be logs."
+          [[ "$REQUEST" =~ $request ]] || fail "request must be the control plane's request id (a UUID)."
+          [[ "$TARGETS" =~ $targets ]] || fail "targets must be exactly one app:env pair."
+          [[ -z "$PLAN_RUN" ]] || fail "plan_run is only for apply."
+          [[ -z "$HASH" ]] || fail "hash is only for apply."
+          [[ "$SERVICE" =~ $service ]] || fail "service must be the name of a part of the app (lower-case letters, digits and hyphens), or empty."
+          [[ "$SINCE" =~ $since ]] || fail "since must be a whole number and a unit (s, m, h or d), such as 15m, or empty."
+          [[ "$TAIL" =~ $tail ]] || fail "tail must be a number of lines from 1 to 2000, or empty."
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "request=$REQUEST" >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "since=$SINCE" >> "$GITHUB_OUTPUT"
+          echo "tail=$TAIL" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Restore OpsCrew's files from the recovery copy
+        env:
+          OPSCREW_CLOUD_AGE_KEY: ${{ secrets.OPSCREW_CLOUD_AGE_KEY }}
+          TARGETS: ${{ steps.validate.outputs.targets }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/opscrew-age.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$OPSCREW_CLOUD_AGE_KEY" > "$key")
+          chmod 600 "$key"
+          IFS=',' read -ra pairs <<< "$TARGETS"
+          for pair in "${pairs[@]}"; do
+            app="${pair%%:*}"
+            env="${pair#*:}"
+            if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+            npx -y opscrew@0.2.9 secrets restore --app "$app_flag" --env "$env" --key-file "$key" --use-copy || echo "::warning::The recovery copy of ${app}:${env} could not be restored."
+          done
+      - name: Read the app's logs
+        env:
+          TARGETS: ${{ steps.validate.outputs.targets }}
+          SERVICE: ${{ steps.validate.outputs.service }}
+          SINCE: ${{ steps.validate.outputs.since }}
+          TAIL: ${{ steps.validate.outputs.tail }}
+          HCLOUD_TOKEN: ${{ secrets.OPSCREW_CLOUD_HCLOUD_TOKEN }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.OPSCREW_CLOUD_DIGITALOCEAN_TOKEN }}
+          CNTB_OAUTH2_CLIENT_ID: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_ID }}
+          CNTB_OAUTH2_CLIENT_SECRET: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_CLIENT_SECRET }}
+          CNTB_OAUTH2_USER: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_USER }}
+          CNTB_OAUTH2_PASS: ${{ secrets.OPSCREW_CLOUD_CNTB_OAUTH2_PASS }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OPSCREW_CLOUD_CLOUDFLARE_API_TOKEN }}
+          PORTAINER_API_KEY: ${{ secrets.OPSCREW_CLOUD_PORTAINER_API_KEY }}
+          OPSCREW_HOSTING_URL: ${{ secrets.OPSCREW_CLOUD_HOSTING_URL }}
+          OPSCREW_HOSTING_USER: ${{ secrets.OPSCREW_CLOUD_HOSTING_USER }}
+          OPSCREW_HOSTING_TOKEN: ${{ secrets.OPSCREW_CLOUD_HOSTING_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pair="$TARGETS"
+          app="${pair%%:*}"
+          env="${pair#*:}"
+          if [[ "$app" == _ ]]; then app_flag=.; else app_flag="$app"; fi
+          flags=()
+          if [[ -n "$SERVICE" ]]; then flags+=(--service "$SERVICE"); fi
+          if [[ -n "$SINCE" ]]; then flags+=(--since "$SINCE"); fi
+          if [[ -n "$TAIL" ]]; then flags+=(--tail "$TAIL"); fi
+          output="$RUNNER_TEMP/logs-output.txt"
+          errors="$RUNNER_TEMP/logs-errors.txt"
+          code=0
+          npx -y opscrew@0.2.9 logs --app "$app_flag" --env "$env" "${flags[@]}" > "$output" 2> "$errors" || code=$?
+          echo "logs.txt $code" >> "$RUNNER_TEMP/exits"
+          tail -c 1048576 "$output" > "$RUNNER_TEMP/out/logs.txt"
+          wc -l < "$output" > "$RUNNER_TEMP/out/lines.txt"
+          cat "$errors" >&2
+          if [[ "$code" != 0 ]]; then sed -n '/^✗ /{s/^✗ //p;q}' "$errors" > "$RUNNER_TEMP/out/error.txt"; fi
+          exit "$code"
+      - name: Write meta.json
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          JOB: ${{ steps.validate.outputs.job }}
+          REQUEST: ${{ steps.validate.outputs.request }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SCRIPT: |
+            import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+            const temp = process.env.RUNNER_TEMP;
+            const exits = {};
+            if (existsSync(`${temp}/exits`)) {
+              for (const line of readFileSync(`${temp}/exits`, "utf8").split("\n")) {
+                const [file, code] = line.split(" ");
+                if (file) exits[file] = Number(code);
+              }
+            }
+            const meta = {
+              request: process.env.REQUEST,
+              job: process.env.JOB,
+              cli: "0.2.9",
+              workflowSha: process.env.WORKFLOW_SHA,
+              exits,
+            };
+            mkdirSync(`${temp}/out`, { recursive: true });
+            writeFileSync(`${temp}/out/meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+        run: node --input-type=module -e "$SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        with:
+          name: opscrew-cloud-logs-${{ steps.validate.outputs.request }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 1
