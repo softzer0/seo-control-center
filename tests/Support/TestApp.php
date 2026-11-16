@@ -192,6 +192,9 @@ final class TestApp
         $container->instance(InMemoryRankings::class, $rankings);
         $container->instance(RankingRepository::class, $rankings);
         $container->instance(RankCheckScheduler::class, $rankings);
+        $rankingImports = new Fakes\InMemoryRankingImports($keywords, $rankings);
+        $container->instance(Fakes\InMemoryRankingImports::class, $rankingImports);
+        $container->instance(\SeoControlCenter\Modules\Rankings\RankingImportStore::class, $rankingImports);
         $competitors = new InMemoryCompetitors($keywords, $rankings, $container->make(Clock::class));
         $container->instance(InMemoryCompetitors::class, $competitors);
         $container->instance(CompetitorRepository::class, $competitors);
@@ -398,9 +401,19 @@ final class TestApp
         $container->instance(\SeoControlCenter\Modules\SiteMigration\SiteMigrationRepository::class, $siteMigrations);
         $container->instance(\SeoControlCenter\Modules\SiteMigration\SiteMigrationScheduler::class, $siteMigrations);
         $container->instance(\SeoControlCenter\Modules\SiteMigration\UrlProbe::class, $siteMigrations);
+        $container->instance(\SeoControlCenter\Modules\System\UpdateCheckStore::class, new Fakes\InMemoryUpdateCheckStore());
+        $shareLinks = new Fakes\InMemoryShareLinks($container->make(Clock::class), $directory);
+        $container->instance(Fakes\InMemoryShareLinks::class, $shareLinks);
+        $container->instance(\SeoControlCenter\Modules\Reports\ShareLinkRepository::class, $shareLinks);
+        $siteHealth = new Fakes\InMemorySiteHealth($container->make(Clock::class));
+        $container->instance(Fakes\InMemorySiteHealth::class, $siteHealth);
+        foreach ([\SeoControlCenter\Modules\SiteHealth\SiteHealthRepository::class, \SeoControlCenter\Modules\SiteHealth\SiteHealthScheduler::class, \SeoControlCenter\Modules\SiteHealth\SiteProbe::class, \SeoControlCenter\Modules\SiteHealth\CertificateProbe::class, \SeoControlCenter\Modules\SiteHealth\DomainExpiryLookup::class] as $contract) {
+            $container->instance($contract, $siteHealth);
+        }
         $botLogs = new Fakes\InMemoryBotLogs($container->make(Clock::class));
         $container->instance(Fakes\InMemoryBotLogs::class, $botLogs);
         $container->instance(\SeoControlCenter\Modules\BotLogs\BotLogRepository::class, $botLogs);
+        $container->instance(\SeoControlCenter\Modules\BotLogs\CrawlerRangeSource::class, $botLogs);
         $container->instance(\SeoControlCenter\Modules\BotLogs\BotLogScheduler::class, $botLogs);
         // Uploaded logs go to a per-container temporary directory, never the repository's storage.
         $container->instance(\SeoControlCenter\Modules\BotLogs\BotLogDirectory::class, new \SeoControlCenter\Modules\BotLogs\BotLogDirectory(sys_get_temp_dir() . '/scc-bot-logs-' . bin2hex(random_bytes(6))));

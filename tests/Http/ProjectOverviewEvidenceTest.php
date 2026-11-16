@@ -85,6 +85,15 @@ final class ProjectOverviewEvidenceTest extends TestCase
             self::assertStringContainsString($text, $html);
         }
         self::assertStringContainsString('Google clicks', $html);
+        $audience = $data['search']['audience'];
+        self::assertTrue($audience['comparable']);
+        self::assertSame(['deu', 'usa', 'aut', 'che', 'gbr', 'nld'], array_column($audience['countries']['rows'], 'key'));
+        self::assertSame(2, $audience['countries']['other']['count']);
+        self::assertSame(28 * 60, $audience['countries']['rows'][0]['previousClicks']);
+        self::assertSame(['MOBILE', 'DESKTOP', 'TABLET'], array_column($audience['devices']['rows'], 'key'));
+        foreach (['Where your traffic comes from', 'Germany', 'United States', '2 other countries', 'Mobile', 'GA4 organic sessions', 'Connect Bing', 'Outlook &amp; audience', 'Do next', '+17 %'] as $text) {
+            self::assertStringContainsString($text, $html);
+        }
         self::assertStringNotContainsString('new query without baseline</td>', $html);
         $doc = HTMLDocument::createFromString($html, LIBXML_NOERROR);
         self::assertCount(1, $doc->querySelectorAll('[data-prognosis]'));
@@ -94,6 +103,27 @@ final class ProjectOverviewEvidenceTest extends TestCase
         self::assertInstanceOf(FakeHttpClient::class, $http);
         self::assertSame([], $http->requests);
         self::assertNotSame(200, $s->loggedIn($s->rivalOwner)->get('/projects/' . $s->acmeProject->publicId)->getStatusCode());
+    }
+
+    public function testAiVisibilityCardSummarisesCitationsVisitsAndMentions(): void
+    {
+        $s = OverviewFixture::scenario();
+        $html = (string) $s->loggedIn($s->viewer)->get('/projects/' . $s->acmeProject->publicId)->getBody();
+        $doc = HTMLDocument::createFromString($html, LIBXML_NOERROR);
+        self::assertNotNull($doc->querySelector('.overview-side-stack #overview-ai-heading'));
+        self::assertStringContainsString('cited in 1 of 1 AI Overviews', $html);
+        self::assertStringContainsString('Not imported yet.', $html);
+        self::assertCount(0, $doc->querySelectorAll('[data-insight-panel="mentions"]'));
+
+        OverviewFixture::seedAi($s);
+        $data = $s->container->make(ProjectOverview::class)->build($s->viewer, $s->acmeProject, '28d');
+        self::assertSame(['ChatGPT', 'Perplexity', 'Gemini'], array_column($data['evidence']['aiReferrals']['current'], 'assistant'));
+        self::assertSame(28 * 6, $data['evidence']['aiReferrals']['current'][0]['sessions']);
+        $html = (string) $s->loggedIn($s->viewer)->get('/projects/' . $s->acmeProject->publicId)->getBody();
+        foreach (['Most cited domains', 'competitor.test', 'Visits from AI assistants', '252</strong>', 'Mentions in AI assistants', 'ChatGPT', '+50 %'] as $text) {
+            self::assertStringContainsString($text, $html);
+        }
+        self::assertStringNotContainsString('Rival', $html);
     }
 
     public function testPartialImportsDoNotRenderMoversOrCtrEstimates(): void

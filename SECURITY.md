@@ -8,6 +8,18 @@ Paid data and client websites are out of scope for testing: use your own install
 
 # Security Requirements
 
+## Optional update check (Unreleased, ADR-053)
+
+Off by default; only users with `system.update` can turn it on or off (audited as `system.update_check_*`) or run it now (rate-limited). The request goes only to `api.github.com` over HTTPS with a fixed user agent and no installation ID, version, domain or other installation data. The response is untrusted: only a semantic version tag, a name (200 characters) and a release link starting with `https://github.com/` are kept, rendered escaped and opened with `rel="noopener noreferrer"`. Nothing is downloaded or executed; installation still requires a manually uploaded package with a valid signature.
+
+## Report client links (Unreleased)
+
+`/share/{token}` is the only unauthenticated page with project data. The token is 32 bytes from `random_bytes`, base64url-encoded (43 characters) and checked against a route pattern before any lookup; only its SHA-256 is stored (as for sessions, ADR-019), so a database copy yields no working links. Unknown, malformed, expired and revoked tokens and links of deleted projects or workspaces all answer the same 404. The page renders only the project report (the sections the project chose), its branding stylesheet, logo and PDF, with no links into the app and no session-dependent content; responses carry `Cache-Control: no-store, private`, `X-Robots-Tag: noindex, nofollow` and `Referrer-Policy: no-referrer` so the token does not leak through caches, search engines or outbound links. Requests are rate-limited to 60 per minute per client address. Creating and revoking need *Edit projects* on the project (404 for foreign projects and links) and are audited (`project.report_link_*`); at most 20 links per project are active.
+
+## Site health (Unreleased)
+
+Health checks contact only the project's own primary domain (HTTPS through `HttpClient`, so public addresses only, pinned, no redirects followed), IANA's RDAP bootstrap file at `data.iana.org` and the RDAP server it names for the domain's ending (HTTPS, exact host allowlist, 512 KB cap). The certificate probe resolves the host, refuses non-public addresses, connects to the first resolved address with SNI and full peer verification, reads the presented certificate and sends nothing after the handshake. No installation, user or project data is sent anywhere. Switching monitoring off or on needs *Edit projects* and is audited (`project.site_health_*`); *Check now* is rate-limited to three runs per project and hour. robots.txt text is stored to show changes and always rendered escaped.
+
 ## Site migrations and bot logs (Unreleased)
 
 Site migration plans and bot logs are project data: routes resolve the project through `ProjectService` (404 for foreign or invisible projects) and the plan or log by public UUID within that project. Creating, importing, choosing targets and deleting need *Edit projects*; redirect tests need *Run analyses* and the Site audit feature. All changes are CSRF-protected and audited (`project.site_migration_*`, `project.bot_log_*`). Forms identify addresses by a SHA-1 of the URL, never an internal ID.
@@ -15,6 +27,8 @@ Site migration plans and bot logs are project data: routes resolve the project t
 Redirect tests go through `SiteCrawler`: HTTPS only, no ports, public hosts only, robots.txt respected, redirects reported but never followed, and only to the plan's two hosts. A plan's old or new origin must be on the project's domain, so a plan cannot turn SEOcc into a request proxy for unrelated sites; tests are rate-limited to four per project and hour.
 
 Uploaded logs are moved to `storage/tmp/bot-logs` outside the web root under a random name, refused unless gzip or NUL-free text, capped at 200 MB and ten uploads per project and hour, and deleted when read, refused or failed (an hourly cleanup removes leftovers). Only crawler requests are kept, as totals per crawler, path and status; IP addresses and visitor requests are never stored. Log lines are parsed with a bounded regular expression (16 KB per line) and never executed or rendered unescaped.
+
+Crawler verification (1.2.1) reads the client IP of a crawler line only to test it against Google's and Bing's published ranges in memory; it is never written to the database, logs or the report. The range files are fetched through `HttpClient` (HTTPS, exact host allowlist `developers.google.com` and `www.bing.com`, 1 MB cap), at most daily, and cached under `storage/cache`. The request carries no installation or project data. Malformed range files are ignored; an unreadable source leaves the crawler unverified rather than failing the import.
 
 ## Page monitoring (Unreleased)
 

@@ -15,6 +15,7 @@ use SeoControlCenter\Domain\Opportunities\Opportunity;
 use SeoControlCenter\Domain\Opportunities\OpportunityRepository;
 use SeoControlCenter\Domain\Opportunities\OpportunityType;
 use SeoControlCenter\Domain\Rankings\AiOverview;
+use SeoControlCenter\Domain\Rankings\AiOverviewReference;
 use SeoControlCenter\Domain\Rankings\RankSnapshot;
 use SeoControlCenter\Domain\Rankings\SerpDevice;
 use SeoControlCenter\Domain\Research\ResearchKeyword;
@@ -68,7 +69,7 @@ final class OverviewFixture
             if ($current) {
                 $queries[] = new DimensionRow('new query without baseline', new Metrics(100, 1000, 2.0));
             }
-            $performance->replaceDay($p->id, $date, ['query' => $queries, 'page' => [new DimensionRow($url . '/collections/indoor', new Metrics($current ? 65 : 40, 2500, 8.0)), new DimensionRow($url . '/guides/germination', new Metrics($current ? 15 : 30, 1400, 12.0))], 'country' => [], 'device' => []]);
+            $performance->replaceDay($p->id, $date, ['query' => $queries, 'page' => [new DimensionRow($url . '/collections/indoor', new Metrics($current ? 65 : 40, 2500, 8.0)), new DimensionRow($url . '/guides/germination', new Metrics($current ? 15 : 30, 1400, 12.0))], 'country' => [new DimensionRow('deu', new Metrics($current ? 70 : 60, 2500, 7.0)), new DimensionRow('usa', new Metrics($current ? 40 : 30, 1800, 8.0)), new DimensionRow('aut', new Metrics(15, 600, 6.5)), new DimensionRow('che', new Metrics($current ? 8 : 10, 400, 7.5)), new DimensionRow('gbr', new Metrics(5, 300, 9.0)), new DimensionRow('nld', new Metrics(4, 200, 9.5)), new DimensionRow('fra', new Metrics(2, 150, 11.0)), new DimensionRow('zzz', new Metrics(1, 50, 12.0))], 'device' => [new DimensionRow('MOBILE', new Metrics($current ? 90 : 70, 3800, 8.0)), new DimensionRow('DESKTOP', new Metrics(50, 2000, 6.5)), new DimensionRow('TABLET', new Metrics(5, 200, 9.0))]]);
             $gaRows[] = new LandingPageMetrics($date, $url . '/collections/indoor', 100, 8.0, 120.0);
             $gaRows[] = new LandingPageMetrics($date, $url . '/guides/germination', 30, 0.0, 0.0);
         }
@@ -112,5 +113,28 @@ final class OverviewFixture
         $audits->pages[$audit->id][1] = new AuditPage(1, $url . '/collections/indoor', 1, 'fetched', 200, 'text/html', noindex: true);
         $audits->finish($audit->id, 'completed', 80, ['error' => 0, 'warning' => 1, 'notice' => 0], [['pageId' => 1, 'type' => IssueType::Noindex, 'detail' => null]], null);
         $c->make(WebVitalsRepository::class)->save($p->id, new WebVitalRecord($url . '/collections/indoor', 3200, 180, 0.08, '2026-09-08', '2026-10-05', '2026-10-06 12:00:00'));
+    }
+
+    /** AI evidence beyond the base seed: cited domains, GA4 visits from assistants and assistant mentions. */
+    public static function seedAi(Scenario $s): void
+    {
+        $c = $s->container;
+        $p = $s->acmeProject;
+        $url = 'https://' . $p->primaryDomain;
+        $keyword = $c->make(Fakes\InMemoryKeywords::class)->keywords[$p->id][2] ?? null;
+        if (is_array($keyword)) {
+            $c->make(AiOverviewRepository::class)->record($p->id, $keyword['id'], SerpDevice::Desktop, '2026-10-06', new AiOverview([new AiOverviewReference($url . '/guides/germination', $p->primaryDomain, null), new AiOverviewReference('https://competitor.test/a', 'competitor.test', null)]), 1, $url . '/guides/germination');
+        }
+        $rows = [];
+        foreach (new DateRange('2026-08-12', '2026-10-06')->eachDay() as $date) {
+            $current = $date >= '2026-09-09';
+            $rows[] = ['date' => $date, 'source' => 'chatgpt.com', 'sessions' => $current ? 6 : 4, 'key_events' => 0.5, 'revenue' => 0.0];
+            $rows[] = ['date' => $date, 'source' => 'perplexity.ai', 'sessions' => 2, 'key_events' => 0.0, 'revenue' => 0.0];
+            $rows[] = ['date' => $date, 'source' => 'gemini.google.com', 'sessions' => $current ? 1 : 0, 'key_events' => 0.0, 'revenue' => 0.0];
+        }
+        $c->make(\SeoControlCenter\Modules\Analytics\AiReferralRepository::class)->save($p->id, new DateRange('2026-08-12', '2026-10-06'), new \SeoControlCenter\Domain\Analytics\Ga4AiReferralReport($rows, 'USD', false));
+        $mentions = $c->make(\SeoControlCenter\Modules\Research\AiMentionHistory::class);
+        $mentions->record($p->id, $p->workspaceId, '2026-09-29', [new \SeoControlCenter\Domain\Research\AiMention($p->primaryDomain, 'chat_gpt', 4), new \SeoControlCenter\Domain\Research\AiMention($p->primaryDomain, 'google', 2)]);
+        $mentions->record($p->id, $p->workspaceId, '2026-10-06', [new \SeoControlCenter\Domain\Research\AiMention($p->primaryDomain, 'chat_gpt', 6), new \SeoControlCenter\Domain\Research\AiMention($p->primaryDomain, 'google', 2)]);
     }
 }

@@ -1,5 +1,21 @@
 # Database Design
 
+## Imported ranking history (Unreleased, migration 2026_11_16_000400)
+
+`ranking_snapshots.source` (ASCII VARCHAR(10), NULL) is `import` for positions brought in from another tool and NULL for SEOcc's own checks. Imports use `INSERT IGNORE`, so a day already checked (or imported) keeps its row; `storeSnapshot` sets `source = NULL` when a check replaces an imported day. `ranking_daily` rows of imported days are rebuilt with the existing `aggregate`. Forward-only.
+
+## Report client links (Unreleased, migration 2026_11_16_000300)
+
+`report_share_links` stores a public UUID, workspace and project FKs (cascading), the SHA-256 of the link token (BINARY(32), unique) and its first six characters as a hint, a label, creator, expiry, revocation time, view count and last view. The token itself is never stored. Lookups join `projects` and `workspaces` and exclude deleted ones, so a deleted project's links stop working without a cleanup job. InnoDB, utf8mb4_unicode_ci, forward-only.
+
+## Site health (Unreleased, migration 2026_11_16_000200)
+
+`site_health_state` holds one row per project (PK `project_id`, workspace and project FKs, cascading): whether monitoring is on, the latest uptime answer (status, code, milliseconds, error, consecutive failures, down since), certificate expiry and issuer, the registered domain with expiry and registrar, robots.txt status, SHA-1 and text (up to 65,000 characters, to show what changed), sitemap URL count, and the time of each check. A project without a row is monitored with the defaults. `site_health_events` records each event once per `(project_id, dedupe_key)` (`INSERT IGNORE`), with a public UUID, kind, title, detail and UTC time; the dispatcher keeps the newest 200 per project. Both are InnoDB, utf8mb4_unicode_ci, forward-only.
+
+## Bot log verification (Unreleased, migration 2026_11_16_000100)
+
+`bot_log_hits.verified_hits` (INT UNSIGNED, default 0) counts the requests of each total that came from the crawler's published IP ranges, merged with the same `ON DUPLICATE KEY UPDATE` as `hits`. `bot_log_imports.verified_bots` (ASCII, comma-separated, NULL before) lists the crawlers every run of the import could verify: the first run sets it and continuations only remove crawlers, under a row lock, so a verified count never covers part of a log. Reads report `verified` only for listed crawlers and NULL otherwise. No IP address is stored. Forward-only; older files ignore the columns.
+
 ## Hreflang, structured data, site migrations and bot logs (Unreleased, migrations 2026_11_15_000100–000300)
 
 `site_audit_pages` gains `hreflang_links` (TEXT, JSON list of `{lang, url}`, at most 50 and trimmed to fit), `html_lang` (VARCHAR 35) and `schema_problems` (VARCHAR 4000, JSON list of `{level, type, problem}`, at most 10). Pages crawled before stay NULL and count as unknown. New issue types reuse the existing `site_audit_issues.type` column (VARCHAR 40), so no issue schema changes.
