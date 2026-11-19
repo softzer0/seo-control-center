@@ -439,15 +439,22 @@ jobs:
           snapshot_tar() {
             _ran="$(docker compose ps -q "$1")"
             _copied=1
+            if [ -n "$_ran" ]; then
+              _tar_service="$1"
+              trap 'snapshot_start "$_tar_service"' EXIT
+              trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+            fi
             if ! snapshot_stop "$1"; then
               printf '%s did not stop cleanly within 120 seconds (Docker killed it when the time ran out, or it ran out of memory), so OpsCrew did not copy its files.\n' "$1" >&2
             elif snapshot_box ro "$1" "tar -C / -cf - $3" < /dev/null > .snapshots/"$2"/"$1".tar; then
               _copied=0
             fi
             if [ -n "$_ran" ] && ! snapshot_start "$1"; then
+              trap - EXIT HUP INT TERM
               printf '%s did not start again after its copy. Its output is in %s/.snapshots/snapshot.log; start it with docker compose up -d %s in %s.\n' "$1" "$APPS_DIR"/seocc "$1" "$APPS_DIR"/seocc >&2
               return 1
             fi
+            trap - EXIT HUP INT TERM
             return "$_copied"
           }
           snapshot_untar() {
@@ -693,8 +700,8 @@ jobs:
               echo 'A restore needs its one-time approval on this server (.restore-snapshot), which opscrew restore writes once you approve it, so nothing was changed. Run opscrew restore.' >&2
               return 1
             fi
-            approved=""; choice=""; expiry=""
-            read -r approved choice expiry < .restore-snapshot || true
+            approved=""; choice=""; expiry=""; kept=""
+            read -r approved choice expiry kept < .restore-snapshot || true
             rm -f .restore-snapshot
             if [ "$approved" != "$_id" ] || [ "$choice" != "${_only:--}" ]; then
               echo 'The one-time approval on this server (.restore-snapshot) is for another restore, so OpsCrew removed it and changed nothing. Run opscrew restore again.' >&2
@@ -859,8 +866,8 @@ jobs:
           }
           running="$(snapshot_running)"
           if [ "$MODE" = rollback ] && [ -f .rollback-database ]; then
-            approved=""; choice=""; expiry=""
-            read -r approved choice expiry < .rollback-database || true
+            approved=""; choice=""; expiry=""; kept=""
+            read -r approved choice expiry kept < .rollback-database || true
             rm -f .rollback-database
             if [ "$approved" != "$target" ]; then
               echo '::warning::The approval to change the database on a rollback (.rollback-database on the server) is for another version, so OpsCrew removed it: this rollback keeps the database as it is.'
@@ -939,6 +946,21 @@ jobs:
           ) 9> "$EDGE_DIR"/.lock
           docker compose up -d --no-deps --wait mysql
           if crontab -l 2> /dev/null | grep -q ' # opscrew-snapshots seocc$'; then crontab -l | grep -v ' # opscrew-snapshots seocc$' | crontab -; fi
+          if [ "$MODE" = deploy ] && [ -n "$running" ] && [ "$running" != "$target" ]; then
+            OPSCREW_SNAPSHOT_FUNCTIONS=1 . ./snapshot.sh
+            snap=0
+            snapshot_cmd_take release > /dev/null || snap=$?
+            if [ "$snap" -eq 1 ]; then
+              printf '::error::The snapshot of the data before this release failed, so the new version was not started and the previous version keeps serving. The copies'\'' output stays on the server in %s/.snapshots/snapshot.log (it can quote data from the database, so it is not printed here; opscrew/RUNBOOK.md has the SSH command). Fix its cause and push again, or set deploy.snapshots: false in opscrew/plan.yaml to deploy without snapshots.\n' "$APPS_DIR"/seocc
+              exit 1
+            fi
+            if [ "$snap" -eq 2 ]; then
+              printf '::warning::The disk that holds %s has less than 1 GiB or 10%% free, so OpsCrew takes no snapshot of the data this time, and a rollback can'\''t restore it to this moment. Free some space, or keep fewer snapshots (deploy.keepSnapshots in opscrew/plan.yaml).\n' "$APPS_DIR"/seocc
+            fi
+            if [ "$snap" -eq 0 ]; then
+              echo 'OpsCrew took a snapshot of the data before this release: a rollback to the previous version can restore it.'
+            fi
+          fi
           for service in cron; do
             if [ -n "$(docker compose ps -q "$service")" ]; then echo "$service"; fi
           done > .processes.previous
