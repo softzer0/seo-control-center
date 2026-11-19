@@ -109,7 +109,67 @@ final class RankingsHttpTest extends TestCase
         self::assertStringContainsString('green shoes', $html);
         self::assertStringContainsString('&gt;100', $html);
         self::assertStringContainsString('data-suffix=" %"', $html, 'Visibility chart with two days of data.');
+        self::assertStringContainsString('<rect class="google-update"', $html, 'The September 2026 spam update overlaps the chart.');
+        self::assertStringContainsString('September 2026 spam update (2026-09-24 to 2026-10-08)', $html);
         self::assertStringNotContainsString('Tracking settings', $html, 'Viewers cannot change settings.');
+    }
+
+    public function testBothDevicesSettingAndComparison(): void
+    {
+        $this->connectDataForSeo();
+        $project = $this->s->acmeProject->id;
+        $this->keywords->add($project, ['red shoes', 'blue shoes', 'green shoes', 'pink shoes'], KeywordLocale::default(), $this->s->owner->id);
+        $owner = $this->s->loggedIn($this->s->owner);
+        self::assertStringContainsString('estimated at up to $0.08 per check', (string) $owner->get($this->url())->getBody());
+        $owner->post($this->url() . '/settings', ['enabled' => '1', 'device' => 'desktop', 'frequency' => 'daily']);
+        self::assertCount(1, $this->rankings->requests);
+        $owner->get($this->url());
+        $owner->post($this->url() . '/settings', ['enabled' => '1', 'device' => 'desktop', 'frequency' => 'daily', 'both_devices' => '1']);
+        self::assertTrue($this->rankings->settings($project)->bothDevices);
+        self::assertCount(2, $this->rankings->requests, 'Adding the second device checks right away.');
+        $html = (string) $owner->get($this->url())->getBody();
+        self::assertStringContainsString('estimated at up to $0.16 per check', $html);
+        self::assertStringContainsString('Google desktop + mobile', $html);
+
+        $ids = array_column($this->keywords->keywords[$project], 'id');
+        foreach ([[SerpDevice::Desktop, [3, 4, 8, null]], [SerpDevice::Mobile, [12, 5, null, null]]] as [$device, $positions]) {
+            foreach ($positions as $i => $position) {
+                $this->rankings->storeSnapshot(new RankSnapshot($ids[$i], $project, $device, '2026-09-26', $position, $position, null, [], []));
+            }
+            $this->rankings->aggregate($project, $this->s->acme->id, $device, '2026-09-26');
+        }
+
+        $page = (string) $this->s->loggedIn($this->s->viewer)->get($this->url() . '/devices')->getBody();
+        self::assertStringContainsString('2 of 4 keywords checked on both devices.', $page);
+        self::assertMatchesRegularExpression('#green shoes</a></th>\s*<td>8</td>\s*<td>&gt;100</td>\s*<td>Only desktop</td>.*red shoes</a></th>\s*<td>3</td>\s*<td>12</td>\s*<td>9 places lower</td>#s', $page);
+        self::assertStringNotContainsString('blue shoes</a>', $page, 'One place apart is no gap.');
+        self::assertStringNotContainsString('pink shoes</a>', $page);
+    }
+
+    public function testSnippetsAndQuestionsPage(): void
+    {
+        $project = $this->s->acmeProject->id;
+        $this->keywords->add($project, ['red shoes', 'blue shoes', 'green shoes', 'pink shoes'], KeywordLocale::default(), $this->s->owner->id);
+        $ids = array_column($this->keywords->keywords[$project], 'id');
+        $snap = fn(int $i, string $day, ?int $position, array $features, ?string $holder, array $questions = []): RankSnapshot
+            => new RankSnapshot($ids[$i], $project, SerpDevice::Desktop, $day, $position, $position, $position !== null ? 'https://shop.acme.test/p' . $i : null, array_values(array_map('strval', $features)), [], $holder, array_values(array_map('strval', $questions)));
+        // An older check with a snippet does not count once the latest one has none.
+        $this->rankings->storeSnapshot($snap(0, '2026-09-19', 9, ['featured_snippet'], 'rival.test'));
+        $this->rankings->storeSnapshot($snap(0, '2026-09-26', 4, ['featured_snippet', 'people_also_ask'], 'www.rival.test', ['How do red shoes fit?']));
+        $this->rankings->storeSnapshot($snap(1, '2026-09-26', 1, ['featured_snippet'], 'www.shop.acme.test'));
+        $this->rankings->storeSnapshot($snap(2, '2026-09-19', 30, ['featured_snippet'], 'rival.test'));
+        $this->rankings->storeSnapshot($snap(2, '2026-09-26', 30, [], null));
+        $this->rankings->storeSnapshot($snap(3, '2026-09-26', 25, ['featured_snippet'], null));
+
+        $html = (string) $this->s->loggedIn($this->s->viewer)->get($this->url() . '/answers')->getBody();
+
+        self::assertStringContainsString('1 within reach', $html);
+        self::assertStringContainsString('1 held by shop.acme.test', $html, 'The www host of the project domain holds it.');
+        self::assertMatchesRegularExpression('#red shoes</a> <span class="badge badge-warning">Within reach.*blue shoes</a> <span class="badge badge-ok">Yours.*pink shoes#s', $html);
+        self::assertStringContainsString('Not recorded (check before 1.5.0)', $html);
+        self::assertStringNotContainsString('green shoes', $html);
+        self::assertStringContainsString('How do red shoes fit?', $html);
+        self::assertStringContainsString('/rankings/answers', (string) $this->s->loggedIn($this->s->viewer)->get($this->url())->getBody());
     }
 
     public function testViewersCannotSpendAndOtherTenantsGetNotFound(): void

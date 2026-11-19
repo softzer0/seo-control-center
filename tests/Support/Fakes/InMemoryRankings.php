@@ -15,6 +15,7 @@ use SeoControlCenter\Domain\Rankings\RankingRepository;
 use SeoControlCenter\Domain\Rankings\RankingSettings;
 use SeoControlCenter\Domain\Rankings\RankingSyncState;
 use SeoControlCenter\Domain\Rankings\RankSnapshot;
+use SeoControlCenter\Domain\Rankings\SerpAnswers;
 use SeoControlCenter\Domain\Rankings\SerpDevice;
 
 /**
@@ -216,6 +217,58 @@ final class InMemoryRankings implements RankingRepository, RankCheckScheduler
         return $checks;
     }
 
+    public function shownTitles(int $projectId, SerpDevice $device, string $since, int $limit): array
+    {
+        $rows = [];
+        foreach ($this->keywords->keywords[$projectId] ?? [] as $keyword) {
+            $latest = null;
+            foreach ($this->snapshots as $s) {
+                if ($s->projectKeywordId === $keyword['id'] && $s->device === $device && $s->checkedOn >= $since && $s->shownTitle !== null && $s->url !== null
+                    && ($latest === null || $s->checkedOn > $latest->checkedOn)) {
+                    $latest = $s;
+                }
+            }
+            if ($latest !== null && $latest->url !== null && $latest->shownTitle !== null) {
+                $rows[] = ['url' => $latest->url, 'title' => $latest->shownTitle, 'keyword' => $keyword['keyword'], 'checkedOn' => $latest->checkedOn];
+            }
+        }
+        usort($rows, static fn(array $a, array $b): int => [$a['url'], $a['keyword']] <=> [$b['url'], $b['keyword']]);
+
+        return array_slice($rows, 0, max(1, $limit));
+    }
+
+    /** @var array<string, true> snapshots (keyed like $snapshots) that came from an import; volatility leaves them out */
+    public array $imported = [];
+
+    public function volatility(int $projectId, SerpDevice $device, string $since): array
+    {
+        $days = [];
+        foreach ($this->keywords->keywords[$projectId] ?? [] as $keyword) {
+            $checks = [];
+            foreach ($this->snapshots as $key => $s) {
+                if ($s->projectKeywordId === $keyword['id'] && $s->device === $device && !isset($this->imported[$key])) {
+                    $checks[$s->checkedOn] = min($s->position ?? 21, 21);
+                }
+            }
+            ksort($checks);
+            $previous = null;
+            foreach ($checks as $date => $position) {
+                $date = (string) $date;
+                if ($previous !== null && $date >= $since && (int) (new \DateTimeImmutable($previous[0]))->diff(new \DateTimeImmutable($date))->days <= 8 && !($position === 21 && $previous[1] === 21)) {
+                    $days[$date][] = abs($position - $previous[1]);
+                }
+                $previous = [$date, $position];
+            }
+        }
+        ksort($days);
+        $rows = [];
+        foreach ($days as $date => $moves) {
+            $rows[] = ['date' => (string) $date, 'pairs' => count($moves), 'moved' => count(array_filter($moves, static fn(int $m): bool => $m !== 0)), 'average' => round(array_sum($moves) / count($moves), 3)];
+        }
+
+        return $rows;
+    }
+
     public function comparableChecks(int $projectId, SerpDevice $device, string $date, int $maxGapDays): array
     {
         $since = (new \DateTimeImmutable($date))->modify(sprintf('-%d days', $maxGapDays))->format('Y-m-d');
@@ -241,6 +294,26 @@ final class InMemoryRankings implements RankingRepository, RankCheckScheduler
         }
 
         return $rows;
+    }
+
+    public function answers(int $projectId, int $workspaceId, SerpDevice $device, int $limit): array
+    {
+        $result = [];
+        foreach ($this->keywords->keywords[$projectId] ?? [] as $row) {
+            $latest = null;
+            foreach ($this->snapshots as $s) {
+                if ($s->projectKeywordId === $row['id'] && $s->device === $device && ($latest === null || $s->checkedOn > $latest->checkedOn)) {
+                    $latest = $s;
+                }
+            }
+            $hasSnippet = $latest !== null && ($latest->snippetDomain !== null || in_array('featured_snippet', $latest->features, true));
+            if ($latest === null || (!$hasSnippet && $latest->questions === [])) {
+                continue;
+            }
+            $result[] = new SerpAnswers($row['public_id'], $row['keyword'], $row['locale'], $latest->checkedOn, $latest->position, $latest->url, $hasSnippet, $latest->snippetDomain, $latest->questions, null);
+        }
+
+        return array_slice($result, 0, $limit);
     }
 
     public function checkDays(int $projectId, SerpDevice $device, string $since): array

@@ -1,5 +1,22 @@
 # Database Design
 
+## Shown titles and disavow list (1.7.0, migrations 2026_11_19_000100–000200)
+
+- `ranking_snapshots.shown_title` (VARCHAR(300), NULL): the title Google showed for the project's own result in that check; NULL without an own result and for checks before 1.7.0.
+- `backlink_disavows` — per project and domain (PK, ASCII, 253): `workspace_id`, `spam_score` (TINYINT, the score when added, NULL when unknown), `added_by` (SET NULL), `added_at`. At most 5,000 domains per project. Cascades on project deletion.
+
+## Devices, competitor watch and brand mentions (1.6.0, migrations 2026_11_16_000800–001000)
+
+- `project_ranking_settings.both_devices` (TINYINT(1), default 0): each check also covers the device other than `device`, which stays the primary one.
+- `competitor_watch` — one row per project: `workspace_id`, `enabled` (opt-in), `updated_at`. `competitor_sitemaps` — one row per competitor (cascade): `project_id`, `checked_on`, `baseline_on` (the first successful read), `urls`, `capped`, `error` (255). `competitor_pages` — per competitor and SHA-256 of the URL (PK): `project_id`, `url` (2,048), `first_seen` (NULL for pages of the baseline), `removed_on` (set when a complete later read no longer lists it, cleared when it returns); indexed by project and either date. All cascade on project and competitor deletion.
+- `research_results.kind` gains `bl_mentions` (pages naming the brand; `params.brand` holds the searched name).
+
+## Sitemap, image, snippet and link reclamation data (1.5.0, migrations 2026_11_16_000500–000700)
+
+- `site_audits.sitemap_urls` (INT UNSIGNED, NULL) counts the sitemap URLs seeded into the audit (NULL for audits before it was recorded). `site_audit_pages.in_sitemap` (TINYINT(1), NULL) is 1 for sitemap pages, 0 for pages found only through links, NULL for older audits. `site_audit_pages.image_signals` (VARCHAR(500) JSON, NULL): `images`, `missing_dimensions`, `lazy_first`. `site_audit_resources.bytes` (INT UNSIGNED, NULL, from Content-Range or Content-Length) and `content_type` (ASCII VARCHAR(100), NULL).
+- `ranking_snapshots.snippet_domain` (VARCHAR(253), NULL): the host holding the featured snippet, traced like organic results. `ranking_snapshots.paa_questions` (TEXT JSON list, NULL): up to eight “People also ask” questions. A same-day re-check replaces both.
+- `backlink_target_checks` — per project and SHA-256 of the linked URL (PK): `url` (2,048), `status`, `location`, `final_status` (the answer of the one redirect followed), `error` (255), `checked_at`. `backlink_target_runs` — one row per project: `workspace_id`, `state` (queued, running, done, failed), `error`, `queued_at`, `finished_at`; state changes after queueing require the workspace to match. Both cascade on project deletion. Forward-only.
+
 ## Imported ranking history (Unreleased, migration 2026_11_16_000400)
 
 `ranking_snapshots.source` (ASCII VARCHAR(10), NULL) is `import` for positions brought in from another tool and NULL for SEOcc's own checks. Imports use `INSERT IGNORE`, so a day already checked (or imported) keeps its row; `storeSnapshot` sets `source = NULL` when a check replaces an imported day. `ranking_daily` rows of imported days are rebuilt with the existing `aggregate`. Forward-only.

@@ -146,6 +146,18 @@ final class SearchConsoleModule implements Module, ProvidesJobs
             $c->make(SearchConsoleExtras::class),
             $c->make(Clock::class),
         ));
+        $container->singleton(Controllers\NewQueriesController::class, static fn(Container $c): Controllers\NewQueriesController => new Controllers\NewQueriesController(
+            new NewQueriesService($c->make(SearchPerformanceReader::class), $c->make(\SeoControlCenter\Domain\Keywords\KeywordRepository::class), $c->make(ProjectService::class)),
+            $c->make(ProjectService::class),
+            $c->make(ResponseFactory::class),
+            $c->make(ViewRenderer::class),
+        ));
+        $container->singleton(Controllers\UpdateImpactController::class, static fn(Container $c): Controllers\UpdateImpactController => new Controllers\UpdateImpactController(
+            new UpdateImpactService($c->make(SearchPerformanceReader::class)),
+            $c->make(ProjectService::class),
+            $c->make(ResponseFactory::class),
+            $c->make(ViewRenderer::class),
+        ));
         $container->singleton(IntegrationsController::class, static fn(Container $c): IntegrationsController => new IntegrationsController(
             $c->make(SearchConsoleService::class),
             $c->make(ResponseFactory::class),
@@ -187,6 +199,8 @@ final class SearchConsoleModule implements Module, ProvidesJobs
         $routes->get('/projects/' . $project . '/performance', PerformanceController::class, 'show', 'projects.performance');
         $routes->post('/projects/' . $project . '/performance/import', PerformanceController::class, 'import');
         $routes->get('/projects/' . $project . '/performance/export', PerformanceController::class, 'export', 'projects.performance.export');
+        $routes->get('/projects/' . $project . '/performance/updates', Controllers\UpdateImpactController::class, 'show', 'projects.performance.updates');
+        $routes->get('/projects/' . $project . '/performance/new-queries', Controllers\NewQueriesController::class, 'show', 'projects.performance.new_queries');
     }
 
     public function registerJobs(JobRegistry $jobs, Container $container): void

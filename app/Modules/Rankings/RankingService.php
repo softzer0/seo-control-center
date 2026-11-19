@@ -28,6 +28,7 @@ use SeoControlCenter\Domain\Rankings\RankingMove;
 use SeoControlCenter\Domain\Rankings\RankingRepository;
 use SeoControlCenter\Domain\Rankings\RankingSettings;
 use SeoControlCenter\Domain\Rankings\RankingSyncState;
+use SeoControlCenter\Domain\Rankings\SerpAnswers;
 use SeoControlCenter\Domain\Rankings\SerpDevice;
 use SeoControlCenter\Domain\Rankings\SerpProvider;
 use SeoControlCenter\Domain\SearchConsole\Metrics;
@@ -47,6 +48,10 @@ final readonly class RankingService
     public const int COMPARE_DAYS = 7;
     public const int MOVERS = 10;
     public const int HISTORY_DAYS = 365;
+    public const int ANSWER_LIMIT = 500;
+    public const int DEVICE_GAP = 5;
+    /** Days of ranking volatility shown (1.7.0). */
+    public const int VOLATILITY_DAYS = 90;
     private const int SEARCH_CONSOLE_DAYS = 28;
 
     public function __construct(
@@ -129,7 +134,7 @@ final readonly class RankingService
             'keywordCount' => $total,
             'canManage' => $this->projects->can($user, Permission::AnalysisExecute, $project),
             'providerAvailable' => $this->serp->isAvailable($project->workspaceId),
-            'costPerCheck' => $total * $this->serp->estimatedCost(RankingSettings::DEPTH),
+            'costPerCheck' => $total * $this->serp->estimatedCost(RankingSettings::DEPTH) * count($settings->devices()),
             'latest' => $latest,
             'compare' => $compare,
             'chart' => $chart,
@@ -139,6 +144,104 @@ final readonly class RankingService
             'filter' => $filter,
             'page' => $page,
             'pages' => $pages,
+        ];
+    }
+
+    /**
+     * Ranking volatility of the last 90 days on the primary device (1.7.0),
+     * newest day first, with the Google updates rolling out on each day.
+     *
+     * @return array{
+     *     device: SerpDevice, usual: ?float,
+     *     latest: ?array{date: string, pairs: int, moved: int, average: float, level: string, ratio: ?float},
+     *     days: list<array{date: string, pairs: int, moved: int, average: float, level: string, ratio: ?float, updates: list<string>}>
+     * }
+     */
+    public function volatility(Project $project): array
+    {
+        $device = $this->rankings->settings($project->id)->device;
+        $today = $this->clock->now()->format('Y-m-d');
+        $since = $this->clock->now()->modify('-' . self::VOLATILITY_DAYS . ' days')->format('Y-m-d');
+        $assessment = \SeoControlCenter\Domain\Rankings\Volatility::assess($this->rankings->volatility($project->id, $device, $since));
+        $updates = \SeoControlCenter\Domain\Shared\GoogleUpdates::between($since, $today);
+        $days = [];
+        foreach (array_reverse($assessment['days']) as $day) {
+            $names = [];
+            foreach ($updates as $update) {
+                if ($update['start'] <= $day['date'] && ($update['end'] ?? $today) >= $day['date']) {
+                    $names[] = $update['name'];
+                }
+            }
+            $days[] = [...$day, 'updates' => $names];
+        }
+
+        return ['device' => $device, 'usual' => $assessment['usual'], 'latest' => $assessment['latest'], 'days' => $days];
+    }
+
+    /**
+     * Mobile against desktop (1.6.0), from each keyword's latest check on
+     * both devices: keywords whose positions differ by GAP or more, or rank
+     * on one device only, the largest gaps first.
+     *
+     * @return array{settings: RankingSettings, primary: ?RankingDay, other: ?RankingDay, rows: list<array{keyword: RankedKeyword, primary: ?int, other: ?int, gap: ?int}>, compared: int}
+     */
+    public function devices(Project $project): array
+    {
+        $settings = $this->rankings->settings($project->id);
+        $other = $settings->otherDevice();
+        $limit = max(1, $this->keywords->count($project->id));
+        $otherRows = [];
+        foreach ($this->rankings->keywords($project->id, $project->workspaceId, $other, $limit, 0) as $row) {
+            $otherRows[$row->publicId] = $row;
+        }
+        $rows = [];
+        $compared = 0;
+        foreach ($this->rankings->keywords($project->id, $project->workspaceId, $settings->device, $limit, 0) as $row) {
+            $twin = $otherRows[$row->publicId] ?? null;
+            if ($row->checkedOn === null || $twin?->checkedOn === null) {
+                continue;
+            }
+            $compared++;
+            $gap = $row->position !== null && $twin->position !== null ? $twin->position - $row->position : null;
+            if ($row->position === $twin->position || ($gap !== null && abs($gap) < self::DEVICE_GAP)) {
+                continue;
+            }
+            $rows[] = ['keyword' => $row, 'primary' => $row->position, 'other' => $twin->position, 'gap' => $gap];
+        }
+        usort($rows, static fn(array $a, array $b): int => [$b['gap'] === null ? 1000 : abs($b['gap']), $a['keyword']->keyword] <=> [$a['gap'] === null ? 1000 : abs($a['gap']), $b['keyword']->keyword]);
+
+        return [
+            'settings' => $settings,
+            'primary' => $this->rankings->latestDay($project->id, $settings->device),
+            'other' => $this->rankings->latestDay($project->id, $other),
+            'rows' => $rows,
+            'compared' => $compared,
+        ];
+    }
+
+    /**
+     * Featured snippets and "People also ask" questions of the tracked
+     * keywords (1.5.0), from stored checks only. Snippets another site
+     * holds while the project ranks on page one come first.
+     *
+     * @return array{settings: RankingSettings, domain: string, snippets: list<SerpAnswers>, questions: list<SerpAnswers>, opportunities: int, held: int}
+     */
+    public function answers(Project $project): array
+    {
+        $settings = $this->rankings->settings($project->id);
+        $domain = $this->rankings->projectDomain($project->id, $project->workspaceId) ?? $project->primaryDomain;
+        $all = $this->rankings->answers($project->id, $project->workspaceId, $settings->device, self::ANSWER_LIMIT);
+        $snippets = array_values(array_filter($all, static fn(SerpAnswers $a): bool => $a->hasSnippet));
+        $rank = static fn(SerpAnswers $a): int => $a->isSnippetOpportunity($domain) ? 0 : ($a->holdsSnippet($domain) ? 1 : 2);
+        usort($snippets, static fn(SerpAnswers $a, SerpAnswers $b): int => [$rank($a), $a->position ?? PHP_INT_MAX] <=> [$rank($b), $b->position ?? PHP_INT_MAX]);
+
+        return [
+            'settings' => $settings,
+            'domain' => $domain,
+            'snippets' => $snippets,
+            'questions' => array_values(array_filter($all, static fn(SerpAnswers $a): bool => $a->questions !== [])),
+            'opportunities' => count(array_filter($snippets, static fn(SerpAnswers $a): bool => $a->isSnippetOpportunity($domain))),
+            'held' => count(array_filter($snippets, static fn(SerpAnswers $a): bool => $a->holdsSnippet($domain))),
         ];
     }
 
@@ -190,16 +293,17 @@ final readonly class RankingService
         }
 
         $before = $this->rankings->settings($project->id);
-        $settings = new RankingSettings($enabled, $device, $frequency);
+        $settings = new RankingSettings($enabled, $device, $frequency, ($input['both_devices'] ?? null) === '1');
         $this->rankings->saveSettings($project->id, $settings, $user->id);
         $this->audit->record(new AuditEvent('rankings.settings_updated', ActorType::User, actorUserId: $user->id, actorLabel: $user->email, workspaceId: $project->workspaceId, targetType: 'project', targetId: $project->publicId, metadata: [
             'enabled' => $enabled,
             'device' => $device->value,
             'frequency' => $frequency,
+            'both_devices' => $settings->bothDevices,
         ]), $client);
 
         // Start right away when tracking was just switched on or moved to another device.
-        if ($enabled && (!$before->enabled || $before->device !== $device)) {
+        if ($enabled && (!$before->enabled || $before->device !== $device || (!$before->bothDevices && $settings->bothDevices))) {
             $this->queue($project);
         }
 

@@ -16,12 +16,15 @@ use SeoControlCenter\Domain\Rankings\RankingRepository;
 use SeoControlCenter\Domain\Rankings\RankingSettings;
 use SeoControlCenter\Domain\Rankings\RankingSyncState;
 use SeoControlCenter\Domain\Rankings\RankSnapshot;
+use SeoControlCenter\Domain\Rankings\SerpAnswers;
 use SeoControlCenter\Domain\Rankings\SerpDevice;
 
 final readonly class PdoRankingRepository implements RankingRepository
 {
     /** Keyword table: how far back "previous" and "best" positions are looked up. */
     private const int HISTORY_DAYS = 365;
+    /** Days between two checks of a keyword that still count as consecutive for volatility (weekly checks plus a day). */
+    private const int VOLATILITY_GAP = 8;
     /** Latest (rn = 1) and previous (rn = 2) check per keyword with the best position; parameters: project, device, since. */
     private const string RECENT = 'WITH recent AS (
             SELECT project_keyword_id, position, url, serp_features, checked_on,
@@ -38,11 +41,11 @@ final readonly class PdoRankingRepository implements RankingRepository
 
     public function settings(int $projectId): RankingSettings
     {
-        $row = $this->db->fetchOne('SELECT enabled, device, frequency FROM project_ranking_settings WHERE project_id = ?', [$projectId]);
+        $row = $this->db->fetchOne('SELECT enabled, device, frequency, both_devices FROM project_ranking_settings WHERE project_id = ?', [$projectId]);
 
         return $row === null
             ? RankingSettings::default()
-            : new RankingSettings((bool) $row['enabled'], SerpDevice::from((string) $row['device']), (string) $row['frequency']);
+            : new RankingSettings((bool) $row['enabled'], SerpDevice::from((string) $row['device']), (string) $row['frequency'], (bool) $row['both_devices']);
     }
 
     public function positionBuckets(int $projectId, int $workspaceId, SerpDevice $device, string $date, ?string $cohortDate = null): array
@@ -63,11 +66,11 @@ final readonly class PdoRankingRepository implements RankingRepository
     public function saveSettings(int $projectId, RankingSettings $settings, int $userId): void
     {
         $this->db->execute(
-            'INSERT INTO project_ranking_settings (project_id, enabled, device, frequency, updated_by, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+            'INSERT INTO project_ranking_settings (project_id, enabled, device, frequency, both_devices, updated_by, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), device = VALUES(device), frequency = VALUES(frequency),
-                 updated_by = VALUES(updated_by), updated_at = VALUES(updated_at)',
-            [$projectId, $settings->enabled ? 1 : 0, $settings->device->value, $settings->frequency, $userId, $this->now()],
+                 both_devices = VALUES(both_devices), updated_by = VALUES(updated_by), updated_at = VALUES(updated_at)',
+            [$projectId, $settings->enabled ? 1 : 0, $settings->device->value, $settings->frequency, $settings->bothDevices ? 1 : 0, $userId, $this->now()],
         );
     }
 
@@ -147,10 +150,11 @@ final readonly class PdoRankingRepository implements RankingRepository
     public function storeSnapshot(RankSnapshot $snapshot): void
     {
         $this->db->execute(
-            'INSERT INTO ranking_snapshots (project_keyword_id, project_id, device, checked_on, position, absolute_position, url, serp_features, top_results, checked_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            'INSERT INTO ranking_snapshots (project_keyword_id, project_id, device, checked_on, position, absolute_position, url, serp_features, top_results, checked_at, snippet_domain, paa_questions, shown_title)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE position = VALUES(position), absolute_position = VALUES(absolute_position), url = VALUES(url),
-                 serp_features = VALUES(serp_features), top_results = VALUES(top_results), checked_at = VALUES(checked_at), source = NULL',
+                 serp_features = VALUES(serp_features), top_results = VALUES(top_results), checked_at = VALUES(checked_at), source = NULL,
+                 snippet_domain = VALUES(snippet_domain), paa_questions = VALUES(paa_questions), shown_title = VALUES(shown_title)',
             [
                 $snapshot->projectKeywordId,
                 $snapshot->projectId,
@@ -162,6 +166,9 @@ final readonly class PdoRankingRepository implements RankingRepository
                 $snapshot->features !== [] ? substr(implode(',', $snapshot->features), 0, 500) : null,
                 $snapshot->top !== [] ? json_encode($snapshot->top, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : null,
                 $this->now(),
+                $snapshot->snippetDomain !== null ? mb_substr($snapshot->snippetDomain, 0, 253) : null,
+                $snapshot->questions !== [] ? json_encode(array_slice($snapshot->questions, 0, 8), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE) : null,
+                $snapshot->shownTitle !== null ? mb_substr($snapshot->shownTitle, 0, 300) : null,
             ],
         );
     }
@@ -353,6 +360,58 @@ final readonly class PdoRankingRepository implements RankingRepository
         ], $rows);
     }
 
+    public function answers(int $projectId, int $workspaceId, SerpDevice $device, int $limit): array
+    {
+        $rows = $this->db->fetchAll(
+            sprintf(
+                'WITH latest AS (
+                    SELECT project_keyword_id, checked_on, position, url, serp_features, snippet_domain, paa_questions,
+                           ROW_NUMBER() OVER (PARTITION BY project_keyword_id ORDER BY checked_on DESC) AS rn
+                    FROM ranking_snapshots
+                    WHERE project_id = ? AND device = ? AND checked_on >= ?
+                 )
+                 SELECT pk.public_id, pk.keyword, pk.location_code, pk.language_code,
+                        l.checked_on, l.position, l.url, l.serp_features, l.snippet_domain, l.paa_questions, km.search_volume
+                 FROM latest l
+                 JOIN project_keywords pk ON pk.id = l.project_keyword_id AND pk.project_id = ?
+                 LEFT JOIN keyword_metrics km
+                     ON km.workspace_id = ? AND km.keyword_hash = pk.keyword_hash
+                    AND km.location_code = pk.location_code AND km.language_code = pk.language_code
+                 WHERE l.rn = 1
+                   AND (l.snippet_domain IS NOT NULL OR l.paa_questions IS NOT NULL OR FIND_IN_SET(\'featured_snippet\', l.serp_features) > 0)
+                 ORDER BY km.search_volume IS NULL, km.search_volume DESC, pk.keyword, pk.id
+                 LIMIT %d',
+                max(1, $limit),
+            ),
+            [$projectId, $device->value, $this->historySince(), $projectId, $workspaceId],
+        );
+
+        $result = [];
+        foreach ($rows as $row) {
+            try {
+                $locale = new KeywordLocale((int) $row['location_code'], (string) $row['language_code']);
+            } catch (\InvalidArgumentException) {
+                continue;
+            }
+            $questions = $row['paa_questions'] !== null ? json_decode((string) $row['paa_questions'], true) : [];
+            $features = $row['serp_features'] !== null ? explode(',', (string) $row['serp_features']) : [];
+            $result[] = new SerpAnswers(
+                (string) $row['public_id'],
+                (string) $row['keyword'],
+                $locale,
+                (string) $row['checked_on'],
+                $row['position'] !== null ? (int) $row['position'] : null,
+                $row['url'] !== null ? (string) $row['url'] : null,
+                $row['snippet_domain'] !== null || in_array('featured_snippet', $features, true),
+                $row['snippet_domain'] !== null ? (string) $row['snippet_domain'] : null,
+                is_array($questions) ? array_values(array_filter($questions, 'is_string')) : [],
+                $row['search_volume'] !== null ? (int) $row['search_volume'] : null,
+            );
+        }
+
+        return $result;
+    }
+
     public function checkDays(int $projectId, SerpDevice $device, string $since): array
     {
         return array_map(static fn(array $r): string => (string) $r['checked_on'], $this->db->fetchAll('SELECT DISTINCT checked_on FROM ranking_snapshots WHERE project_id = ? AND device = ? AND checked_on >= ? ORDER BY checked_on', [$projectId, $device->value, $since]));
@@ -374,6 +433,57 @@ final readonly class PdoRankingRepository implements RankingRepository
             $r['from_position'] !== null ? (int) $r['from_position'] : null,
             $r['to_position'] !== null ? (int) $r['to_position'] : null,
         ), $rows);
+    }
+
+    public function shownTitles(int $projectId, SerpDevice $device, string $since, int $limit): array
+    {
+        $rows = $this->db->fetchAll(
+            sprintf(
+                'SELECT url, shown_title, checked_on, keyword FROM (
+                     SELECT rs.url, rs.shown_title, rs.checked_on, pk.keyword,
+                            ROW_NUMBER() OVER (PARTITION BY rs.project_keyword_id ORDER BY rs.checked_on DESC) AS rn
+                     FROM ranking_snapshots rs
+                     JOIN project_keywords pk ON pk.id = rs.project_keyword_id AND pk.project_id = rs.project_id
+                     WHERE rs.project_id = ? AND rs.device = ? AND rs.checked_on >= ? AND rs.shown_title IS NOT NULL AND rs.url IS NOT NULL
+                 ) latest WHERE rn = 1 ORDER BY url, keyword LIMIT %d',
+                max(1, $limit),
+            ),
+            [$projectId, $device->value, $since],
+        );
+
+        return array_map(static fn(array $r): array => [
+            'url' => (string) $r['url'],
+            'title' => (string) $r['shown_title'],
+            'keyword' => (string) $r['keyword'],
+            'checkedOn' => (string) $r['checked_on'],
+        ], $rows);
+    }
+
+    public function volatility(int $projectId, SerpDevice $device, string $since): array
+    {
+        // Positions beyond 20 count as 21: movement far down the results is noise for this purpose.
+        $rows = $this->db->fetchAll(
+            'SELECT checked_on, COUNT(*) AS pairs, SUM(p <> prev_p) AS moved, AVG(ABS(p - prev_p)) AS average FROM (
+                 SELECT checked_on, p,
+                        LAG(checked_on) OVER (PARTITION BY project_keyword_id ORDER BY checked_on) AS prev_on,
+                        LAG(p) OVER (PARTITION BY project_keyword_id ORDER BY checked_on) AS prev_p
+                 FROM (
+                     SELECT project_keyword_id, checked_on, CAST(LEAST(COALESCE(position, 21), 21) AS SIGNED) AS p
+                     FROM ranking_snapshots
+                     WHERE project_id = ? AND device = ? AND checked_on >= DATE_SUB(?, INTERVAL ' . self::VOLATILITY_GAP . ' DAY) AND source IS NULL
+                 ) s
+             ) c
+             WHERE prev_on IS NOT NULL AND checked_on >= ? AND DATEDIFF(checked_on, prev_on) <= ' . self::VOLATILITY_GAP . ' AND NOT (p = 21 AND prev_p = 21)
+             GROUP BY checked_on ORDER BY checked_on',
+            [$projectId, $device->value, $since, $since],
+        );
+
+        return array_map(static fn(array $r): array => [
+            'date' => (string) $r['checked_on'],
+            'pairs' => (int) $r['pairs'],
+            'moved' => (int) $r['moved'],
+            'average' => round((float) $r['average'], 3),
+        ], $rows);
     }
 
     public function syncState(int $projectId): ?RankingSyncState

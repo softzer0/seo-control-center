@@ -198,6 +198,11 @@ final class TestApp
         $competitors = new InMemoryCompetitors($keywords, $rankings, $container->make(Clock::class));
         $container->instance(InMemoryCompetitors::class, $competitors);
         $container->instance(CompetitorRepository::class, $competitors);
+        $competitorWatch = new Fakes\InMemoryCompetitorWatch();
+        $container->instance(Fakes\InMemoryCompetitorWatch::class, $competitorWatch);
+        $container->instance(\SeoControlCenter\Modules\Competitors\CompetitorWatchRepository::class, $competitorWatch);
+        $container->instance(\SeoControlCenter\Modules\Competitors\CompetitorWatchScheduler::class, $competitorWatch);
+        $container->instance(\SeoControlCenter\Modules\Competitors\CompetitorSitemapReader::class, $competitorWatch);
         $aiOverviews = new InMemoryAiOverviews($directory, $keywords, $rankings);
         $container->instance(InMemoryAiOverviews::class, $aiOverviews);
         $container->instance(AiOverviewRepository::class, $aiOverviews);
@@ -209,6 +214,12 @@ final class TestApp
         $container->instance(InMemoryBacklinkHistory::class, $backlinkHistory);
         $container->instance(BacklinkHistory::class, $backlinkHistory);
         $container->instance(BacklinksScheduler::class, $backlinkHistory);
+        $linkTargets = new \SeoControlCenter\Tests\Support\Fakes\InMemoryLinkTargets($container->make(Clock::class));
+        $container->instance(\SeoControlCenter\Tests\Support\Fakes\InMemoryLinkTargets::class, $linkTargets);
+        $container->instance(\SeoControlCenter\Modules\Backlinks\LinkTargetRepository::class, $linkTargets);
+        $disavows = new Fakes\InMemoryDisavows($container->make(Clock::class));
+        $container->instance(Fakes\InMemoryDisavows::class, $disavows);
+        $container->instance(\SeoControlCenter\Modules\Backlinks\DisavowRepository::class, $disavows);
         $assistant = new InMemoryAssistant($container->make(Clock::class));
         $container->instance(InMemoryAssistant::class, $assistant);
         $container->instance(AssistantSettingsRepository::class, $assistant);

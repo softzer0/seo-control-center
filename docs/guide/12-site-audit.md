@@ -61,7 +61,49 @@ The JSON-LD on indexable pages is checked against what Google documents for its 
 
 Each issue lists up to three problems with the type they belong to. Microdata is recognised for the *No structured data* check but not validated. Pages crawled before 1.2.0 were not validated; the next audit checks them.
 
+### Sitemap
+
+The audit starts from your sitemap and records which pages it lists (1.5.0):
+
+- **Sitemap page is broken** (warning): it answers 4xx or 5xx, or not at all.
+- **Sitemap page redirects** (warning): list the final address instead.
+- **Sitemap page cannot be indexed** (warning): noindex, a canonical pointing elsewhere, or blocked by robots.txt. A sitemap should only list pages you want in search results.
+- **Page missing from the sitemap** (growth notice): an indexable page that other pages link to, but the sitemap does not list. Addresses with parameters, later pages of a paginated list, noindex pages and pages nothing links to are not reported. When the sitemap lists more pages than the audit's page limit allows, this check is skipped, because the rest of the sitemap was not read.
+
+Audits before 1.5.0 and sites without a sitemap are not judged.
+
+### Images
+
+From the images sampled on each page and the page's HTML (1.5.0):
+
+- **Large image** (warning): larger than 300 KB.
+- **Image in an older format** (growth notice): JPEG, PNG, GIF or BMP over 100 KB; WebP or AVIF are usually much smaller.
+- **Images without width and height** (growth notice): the browser cannot reserve space, so the layout shifts while they load (CLS).
+- **First image loads lazily** (growth notice): the first image in the main content has `loading="lazy"`; it is often the largest element, and lazy loading delays it (LCP).
+
+Sizes come from the same small range request that checks the image; nothing more is downloaded. Inline `data:` images and 1×1 tracking pixels are ignored.
+
+### Structured data generator
+
+**Structured data generator** (link at the top of the site audit, 1.5.0) writes JSON-LD for Organization, LocalBusiness, WebSite, Article, Product, FAQ and breadcrumbs. Choose a page from the last audit: SEOcc suggests a type (Organization for the home page, Product or Article by the page's markup and Open Graph type, breadcrumbs otherwise) and fills in what the crawl read, such as the title, headline, description, the business name and phone and a breadcrumb trail from the address. Check every value, fill in the rest, and **Generate JSON-LD**. Required fields that are still empty are listed. Paste the result into the page's HTML; the next audit validates it. Nothing is stored.
+
+### Snippet preview
+
+**Snippet preview** (link at the top of the site audit, 1.6.0) shows each indexable page of the last audit as a Google result, with the title and description cut where Google cuts them. Google measures pixels, not characters: about 600 px for a title (20 px Arial) and 920 px for a description (14 px). Sixty narrow letters can fit where forty capitals do not. The widest titles come first; **Only pages Google cuts** narrows the list, and **Edit in preview** opens a page's wording in the form at the top to try alternatives. Google sometimes rewrites titles and descriptions anyway; this shows what you control.
+
 Title, description, heading and text checks apply only to pages that are meant to be indexed. The pages of a paginated listing (`?page=2`, `?page=3`, …) usually share a title, so they count as one page for duplicate titles and descriptions. Pages with *noindex*, or with a canonical tag pointing to another address, are listed once as such and not checked further.
+
+### Titles Google rewrites
+
+**Titles Google rewrites** (1.7.0) compares the title Google showed for your pages in the rank checks of the last 90 days with the title each page has in the latest audit. *Rewritten* means Google wrote its own title; the share of its words taken from yours shows how far it went. Google usually does this when a title is too long, repeats keywords, is vague or does not match the page; write a title close to the page's main heading. *Site name changed* is usually harmless, *cut* means the title is too wide (see the snippet preview). Google can show different titles for different searches, so a page may appear more than once. Rank checks record these titles from version 1.7.0 on.
+
+### Orphan pages
+
+**Orphan pages** (1.7.0) lists pages Google showed in the last 90 days (Search Console) that no page of the latest audit links to. Link to the ones worth keeping from a related page, and redirect old ones. When the audit stopped at its page limit, pages it never reached are listed as uncertain: they may be linked from pages beyond the limit.
+
+### Pages to prune
+
+**Pages to prune** (1.7.0) lists indexable pages without a single Search Console impression in up to a year, each with a suggestion: *merge or remove* for short pages, *redirect* for pages with backlinks in the stored sample, *improve or noindex* for the rest. New pages (not in the oldest kept audit), the start page, pages canonicalised elsewhere and later listing pages are left out. Pages people reach in other ways (contact, legal, campaigns) need no searches: keep them. Plan the redirects in *Site migration*. The list can be exported as CSV.
 
 ## Reading the results
 

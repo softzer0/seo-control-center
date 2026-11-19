@@ -65,6 +65,36 @@ final readonly class RankingsController
         ], $request))->withHeader('Cache-Control', 'no-store');
     }
 
+    public function devices(ServerRequestInterface $request): ResponseInterface
+    {
+        $project = $this->load($request);
+
+        return $this->responses->html($this->views->render('rankings/devices', [
+            'project' => $project,
+            ...$this->rankings->devices($project),
+        ], $request))->withHeader('Cache-Control', 'no-store');
+    }
+
+    public function volatility(ServerRequestInterface $request): ResponseInterface
+    {
+        $project = $this->load($request);
+
+        return $this->responses->html($this->views->render('rankings/volatility', [
+            'project' => $project,
+            ...$this->rankings->volatility($project),
+        ], $request))->withHeader('Cache-Control', 'no-store');
+    }
+
+    public function answers(ServerRequestInterface $request): ResponseInterface
+    {
+        $project = $this->load($request);
+
+        return $this->responses->html($this->views->render('rankings/answers', [
+            'project' => $project,
+            ...$this->rankings->answers($project),
+        ], $request))->withHeader('Cache-Control', 'no-store');
+    }
+
     public function settings(ServerRequestInterface $request): ResponseInterface
     {
         $project = $this->load($request);
