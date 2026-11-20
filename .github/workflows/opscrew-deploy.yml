@@ -20,12 +20,12 @@ on:
   workflow_dispatch:
     inputs:
       digest:
-        description: For a rollback, the image to deploy, by its digest (sha256:…); `opscrew rollback` fills it in.
+        description: For a rollback or a move, the image to deploy without a build, by its digest (sha256:…); `opscrew rollback` or `opscrew retarget` fills it in.
         required: false
         type: string
         default: ""
       tag:
-        description: For a rollback, the image's commit tag (<commit>, or <commit>-<env> outside prod); `opscrew rollback` fills it in.
+        description: For a rollback, the image's commit tag (<commit>, or <commit>-<env> outside prod; without it, its build's); `opscrew rollback` fills it in.
         required: false
         type: string
         default: ""
@@ -45,7 +45,7 @@ concurrency:
 jobs:
   paused:
     name: Report the deploy pause
-    if: ${{ !(inputs.rollback) && contains(vars.OPSCREW_DEPLOY_PAUSED, '"seocc/prod"') }}
+    if: ${{ !(inputs.rollback || inputs.digest) && contains(vars.OPSCREW_DEPLOY_PAUSED, '"seocc/prod"') }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -72,7 +72,7 @@ jobs:
 
   build:
     name: Build the image
-    if: ${{ !inputs.rollback }}
+    if: ${{ !(inputs.rollback || inputs.digest) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -208,7 +208,7 @@ jobs:
 
   verify:
     name: Check where the image was built
-    if: ${{ inputs.rollback }}
+    if: ${{ inputs.rollback || inputs.digest }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -259,6 +259,8 @@ jobs:
             exit 1
           fi
           read -r event head_repo branch commit workflow <<< "$record"
+          # A move's deploy gives the digest alone: the image's commit tag is its build's.
+          if [[ -z "$TAG" ]]; then TAG="$commit"; fi
           # The run's path can end with @<ref>, which the signing identity carries separately.
           workflow="${workflow%%@*}"
           # A fork's pull request runs in this repository too, with its own branch name: only a push, or a
@@ -294,7 +296,7 @@ jobs:
   deploy:
     name: Deploy to the server
     needs: [build, verify]
-    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.verify.result == 'success') && (inputs.rollback || !contains(vars.OPSCREW_DEPLOY_PAUSED, '"seocc/prod"')) }}
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.verify.result == 'success') && (inputs.rollback || inputs.digest || !contains(vars.OPSCREW_DEPLOY_PAUSED, '"seocc/prod"')) }}
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -364,6 +366,9 @@ jobs:
           #   sh snapshot.sh restore <id> [--only <service>] [--no-wait <service>]...
           #   sh snapshot.sh hold
           #   sh snapshot.sh resume
+          #   sh snapshot.sh drill [<id>] [--only <service>] [--keep]
+          #   sh snapshot.sh drill --remove
+          #   sh snapshot.sh drill scheduled
           #   sh snapshot.sh list
           #   sh snapshot.sh delete <id>
           #   sh snapshot.sh offsite <id>
@@ -577,7 +582,7 @@ jobs:
             done
           }
           snapshot_usage() {
-            echo 'Usage: sh snapshot.sh take <manual|release|scheduled> [--skip <service>]... [--stop <service>]... [--id <id>] [--version sha256:<hex>] | restore <id> [--only <service>] [--no-wait <service>]... | hold | resume | list | delete <id> | offsite <id>' >&2
+            echo 'Usage: sh snapshot.sh take <manual|release|scheduled> [--skip <service>]... [--stop <service>]... [--id <id>] [--version sha256:<hex>] | restore <id> [--only <service>] [--no-wait <service>]... | hold | resume | drill [<id>] [--only <service>] [--keep] | drill --remove | drill scheduled | list | delete <id> | offsite <id>' >&2
           }
           snapshot_id() {
             case "$1" in
@@ -785,6 +790,383 @@ jobs:
             edge exec -T kamal-proxy kamal-proxy resume seocc < /dev/null > /dev/null 2>&1 || true
             rm -f .snapshots/.held
           }
+          snapshot_cmd_drill() (
+            umask 077
+            _drill_id=""; _drill_only=""; _drill_action=drill; _drill_kind=manual; _drill_dir=""; _drill_every=""
+            _drill_watch=""; _drill_version=""; _drill_parts=""; _drill_health=""; _drill_tables=""
+            _drill_removal=""; _drill_cleaned=no; _drill_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            SNAPSHOT_PARTS='mysql files'
+            SNAPSHOT_ONLINE='mysql files'
+            part_file() {
+              case "$1" in
+                mysql)
+                  echo mysql.dump
+                  ;;
+                files)
+                  echo files.tar
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            snapshot_run() {
+              (umask 077; docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml run --rm --no-deps -T --user "$(id -u):$(id -g)" -v "$APPS_DIR"/seocc/.snapshots/"$1":/snapshot:"$2" --entrypoint sh "$3" -c "$4" < /dev/null >> "$_drill_dir"/restore.log 2>&1)
+            }
+            snapshot_box() {
+              _box="$(docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml ps -aq "$2")"
+              [ -n "$_box" ] || return 1
+              docker run --rm -i --network none --volumes-from "$_box:$1" busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 sh -c "$3" 2>> "$_drill_dir"/restore.log
+            }
+            snapshot_start() {
+              case " ${SNAPSHOT_NO_WAIT:-} " in
+                *" $1 "*) docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml up -d --no-deps --no-recreate "$1" >> "$_drill_dir"/restore.log 2>&1 ;;
+                *) docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml up -d --no-deps --no-recreate --wait "$1" >> "$_drill_dir"/restore.log 2>&1 ;;
+              esac
+            }
+            snapshot_untar() {
+              docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml stop -t 120 "$1" >> "$_drill_dir"/restore.log 2>&1 || return 1
+              snapshot_box rw "$1" "$3" < .snapshots/"$2"/"$1".tar || return 1
+              snapshot_start "$1"
+            }
+            snapshot_files_volume() {
+              _volume="seocc-drill_files"
+              docker volume inspect "$_volume" > /dev/null 2>&1
+            }
+            part_restore() {
+              case "$1" in
+                mysql)
+                  snapshot_run "$2" ro mysql 'umask 077 && export MYSQL_PWD="$MYSQL_ROOT_PASSWORD" && mysql -h mysql -u root -e "DROP DATABASE IF EXISTS app; CREATE DATABASE app" && mysql -h mysql -u root app < /snapshot/mysql.dump'
+                  ;;
+                files)
+                  snapshot_files_volume || return 1
+                  docker run --rm -i --network none -v "$_volume":/data busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 sh -c 'find /data -mindepth 1 -delete && tar -C /data -xpf -' < .snapshots/"$2"/files.tar >> "$_drill_dir"/restore.log 2>&1
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            snapshot_complete() {
+              [ -f .snapshots/"$1"/about.json ] || return 1
+              for _complete_file in $(grep -o '"file":"[^"]*"' .snapshots/"$1"/about.json | cut -d '"' -f 4); do
+                [ -f .snapshots/"$1"/"$_complete_file" ] || return 1
+              done
+            }
+            snapshot_parts() {
+              for _listed in $SNAPSHOT_PARTS; do
+                if [ -f .snapshots/"$1"/"$(part_file "$_listed")" ]; then echo "$_listed"; fi
+              done
+            }
+            snapshot_restore() {
+              _restore_id="$1"; shift
+              if [ "$#" -eq 0 ]; then set -- $(snapshot_parts "$_restore_id"); fi
+              for _restore_part in "$@"; do
+                part_restore "$_restore_part" "$_restore_id" || return 1
+              done
+            }
+            generate() {
+              case "$1" in
+                hex32) od -An -tx1 -N32 /dev/urandom | tr -d ' \n' ;;
+                hex64) od -An -tx1 -N64 /dev/urandom | tr -d ' \n' ;;
+                b64k32) printf 'base64:%s' "$(head -c 32 /dev/urandom | base64 | tr -d '\n')" ;;
+                gk) printf 'GK%s' "$(od -An -tx1 -N12 /dev/urandom | tr -d ' \n')" ;;
+              esac
+            }
+            drill_record() {
+              _drill_line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $_drill_kind $1 id=${_drill_id:--} version=${_drill_version:--} start=$_drill_start parts=${_drill_parts:--} health=${_drill_health:--} tables=${_drill_tables:--} removal=${_drill_removal:--} cleaned=$_drill_cleaned reason=${2:--}"
+              (mkdir -p .snapshots && printf '%s\n' "$_drill_line" >> .snapshots/drills.log) || true
+              echo "drill-record $_drill_line"
+            }
+            drill_skip() {
+              case "$1" in
+                locked) echo 'OpsCrew skipped this drill: a deploy or a snapshot was running. Nothing was changed.' >&2 ;;
+                rotation) echo 'OpsCrew skipped this drill: a credential rotation holds the app. Nothing was changed.' >&2 ;;
+                disk) echo 'OpsCrew skipped this drill: the disk has less free space than the snapshot'\''s size and 1 GiB and 10% of the disk. Nothing was changed.' >&2 ;;
+                memory) echo 'OpsCrew skipped this drill: the machine has less free memory than the copy'\''s memory limits add up to. Nothing was changed.' >&2 ;;
+                kept) echo 'OpsCrew skipped this drill: the copy of an earlier drill, kept with --keep, is still here; opscrew restore --drill --remove removes it. Nothing was changed.' >&2 ;;
+                none) echo 'OpsCrew skipped this drill: there is no complete scheduled snapshot here yet. Nothing was changed.' >&2 ;;
+              esac
+              drill_record skipped "$1"
+              exit 3
+            }
+            drill_remove_all() {
+              _drill_ids="$(docker ps -aq --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" || return 1
+              if [ -n "$_drill_ids" ]; then docker rm -f $_drill_ids > /dev/null 2>&1 || return 1; fi
+              _drill_ids="$(docker network ls -q --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" || return 1
+              if [ -n "$_drill_ids" ]; then docker network rm $_drill_ids > /dev/null 2>&1 || return 1; fi
+              _drill_ids="$(docker volume ls -q --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" || return 1
+              if [ -n "$_drill_ids" ]; then docker volume rm $_drill_ids > /dev/null 2>&1 || return 1; fi
+              if [ -e /srv/data/seocc-drill ]; then docker run --rm --network none --user 0:0 --entrypoint rm -v /srv/data:/d busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 -rf /d/seocc-drill > /dev/null 2>&1 || return 1; fi
+              rm -rf .drill
+            }
+            drill_left() {
+              [ -e .drill ] && return 0
+              [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" ] && return 0
+              [ -n "$(docker network ls -q --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" ] && return 0
+              [ -n "$(docker volume ls -q --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null)" ] && return 0
+              [ -e /srv/data/seocc-drill ] && return 0
+              return 1
+            }
+            drill_kill() {
+              _drill_ids="$(docker ps -q --filter "label=com.docker.compose.project=seocc-drill" 2> /dev/null || true)"
+              if [ -n "$_drill_ids" ]; then docker kill $_drill_ids > /dev/null 2>&1 || true; fi
+            }
+            drill_cut_off() {
+              [ "$(docker network inspect --format '{{.Internal}}' seocc-drill_internal 2> /dev/null)" = true ] || return 1
+              for _drill_cc in $(docker ps -aq --filter "label=com.docker.compose.project=seocc-drill"); do
+                [ "$(docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}{{range $k, $v := .HostConfig.PortBindings}}port {{end}}' "$_drill_cc")" = "seocc-drill_internal " ] || return 1
+              done
+            }
+            drill_timed_out() { [ -f .drill/.timed-out ]; }
+            drill_memory() {
+              case "$1" in
+                mysql) echo 512 ;;
+                *) echo 0 ;;
+              esac
+            }
+            drill_count() {
+              case "$1" in
+                mysql) docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml exec -T mysql sh -c 'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD" && mysqladmin -h mysql -u root ping > /dev/null && mysql -h mysql -u root -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '\''app'\''"' < /dev/null 2>> "$_drill_dir"/restore.log ;;
+                *) return 1 ;;
+              esac
+            }
+            drill_finish() {
+              trap - HUP INT TERM
+              if [ -n "$_drill_watch" ]; then
+                kill "$_drill_watch" 2> /dev/null || true
+                wait "$_drill_watch" 2> /dev/null || true
+                _drill_watch=""
+              fi
+              _drill_result="$1"; _drill_reason="${2:--}"
+              if drill_timed_out && [ "$_drill_result" != healthy ]; then _drill_result=failed; _drill_reason=timeout; fi
+              if [ "$_drill_action" = keep ] && [ "$_drill_reason" != network ] && [ "$_drill_reason" != timeout ] && [ -d "$_drill_dir" ]; then
+                : > "$_drill_dir"/kept
+                _drill_removal=kept
+              elif drill_remove_all; then
+                _drill_removal=removed
+              else
+                _drill_removal=failed
+              fi
+              drill_record "$_drill_result" "$_drill_reason"
+              case "$_drill_result" in healthy) exit 0 ;; *) exit 2 ;; esac
+            }
+            if [ "${1:-}" = scheduled ]; then
+              [ "$#" -eq 1 ] || { snapshot_usage; exit 1; }
+              shift
+              _drill_kind=scheduled
+              case "$(cat .drill-recipe/schedule 2> /dev/null || true)" in
+                weekly) _drill_every=168 ;;
+                daily) _drill_every=24 ;;
+                *) echo 'There is no schedule of restore drills here (.drill-recipe/schedule), so nothing was changed. opscrew snapshot drill schedule on, then opscrew provision, puts it here.' >&2; exit 1 ;;
+              esac
+              if [ $(( $(date +%s) / 3600 % _drill_every )) -ne 3 ]; then exit 0; fi
+            fi
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --keep | --remove)
+                  [ "$_drill_action" = drill ] || { snapshot_usage; exit 1; }
+                  _drill_action="${1#--}" ;;
+                --only)
+                  [ "$#" -ge 2 ] && [ -z "$_drill_only" ] || { snapshot_usage; exit 1; }
+                  snapshot_known "$2" || exit 1
+                  _drill_only="$2"
+                  shift ;;
+                -*) snapshot_usage; exit 1 ;;
+                *)
+                  [ -z "$_drill_id" ] || { snapshot_usage; exit 1; }
+                  snapshot_id "$1" || exit 1
+                  _drill_id="$1" ;;
+              esac
+              shift
+            done
+            if [ "$_drill_action" = remove ] && [ -n "$_drill_id$_drill_only" ]; then snapshot_usage; exit 1; fi
+            if [ "$_drill_kind" = manual ]; then
+              if [ ! -f .drill-snapshot ]; then
+                echo 'A drill needs its one-time approval here (.drill-snapshot), which opscrew restore --drill writes once you approve it, so nothing was changed. Run opscrew restore --drill.' >&2
+                exit 1
+              fi
+              approved=""; choice=""; expiry=""; kept=""
+              read -r approved choice expiry kept < .drill-snapshot || true
+              rm -f .drill-snapshot
+              if [ "$approved" != "${_drill_id:--}" ] || [ "$choice" != "$_drill_action" ] || [ "$kept" != "${_drill_only:--}" ]; then
+                echo 'The one-time approval here (.drill-snapshot) is for another drill, so OpsCrew removed it and changed nothing. Run opscrew restore --drill again.' >&2
+                exit 1
+              fi
+              case "$expiry" in "" | *[!0-9]* | ???????????*) expiry=0 ;; esac
+              if [ "$expiry" -le "$(date +%s)" ]; then
+                echo 'The one-time approval of this drill expired before it started, so nothing was changed. Run opscrew restore --drill again.' >&2
+                exit 1
+              fi
+            fi
+            exec 7> .start.lock
+            if ! flock -n 7; then drill_skip locked; fi
+            if snapshot_rotation_held 'OpsCrew skipped this drill: '; then drill_skip rotation; fi
+            if [ "$_drill_action" = remove ]; then
+              if ! drill_left; then
+                echo 'There is no drill'\''s copy here, so nothing was changed.' >&2
+                echo "drill-removal none"
+                exit 0
+              fi
+              if drill_remove_all; then echo "drill-removal removed"; exit 0; fi
+              echo 'OpsCrew could not remove every part of the drill'\''s copy (the project seocc-drill, its volumes and folders). Run opscrew restore --drill --remove again.' >&2
+              echo "drill-removal failed"
+              exit 2
+            fi
+            for _drill_k in .drill/*/kept; do
+              if [ -f "$_drill_k" ]; then
+                if [ "$_drill_kind" = scheduled ]; then drill_skip kept; fi
+                _drill_k="${_drill_k%/kept}"
+                printf 'A kept copy of the snapshot %s is still here, so OpsCrew started no other drill: nothing was changed. Remove it with opscrew restore --drill --remove, then run the drill again.\n' "${_drill_k#.drill/}" >&2
+                echo "drill-kept ${_drill_k#.drill/}"
+                exit 1
+              fi
+            done
+            if drill_left; then
+              if ! drill_remove_all; then drill_record failed leftovers; exit 2; fi
+              _drill_cleaned=yes
+            fi
+            if [ -z "$_drill_id" ]; then
+              _drill_id="$(for _drill_f in .snapshots/*/about.json; do case "$_drill_f" in *.partial/* | *.taking/*) continue ;; esac; if [ "$_drill_kind" = scheduled ] && ! grep -qF '"kind":"scheduled"' "$_drill_f" 2> /dev/null; then continue; fi; _drill_f="${_drill_f%/about.json}"; if [ -f "$_drill_f"/taken ]; then echo "$(cat "$_drill_f"/taken) ${_drill_f#.snapshots/}"; fi; done | sort -r | head -n 1 | cut -d ' ' -f 2)"
+            fi
+            if [ "$_drill_kind" = scheduled ] && { [ -z "$_drill_id" ] || ! snapshot_complete "$_drill_id"; }; then drill_skip none; fi
+            if [ -z "$_drill_id" ] || ! snapshot_complete "$_drill_id"; then
+              printf 'There is no complete snapshot %s here to drill, so nothing was changed. opscrew snapshot list shows the snapshots.\n' "$_drill_id" >&2
+              exit 1
+            fi
+            _drill_list="$(snapshot_parts "$_drill_id")"
+            _drill_list="$(echo $_drill_list)"
+            if [ -n "$_drill_only" ]; then
+              case " $_drill_list " in
+                *" $_drill_only "*) _drill_list="$_drill_only" ;;
+                *) printf 'The snapshot %s holds no copy of %s, so nothing was changed.\n' "$_drill_id" "$_drill_only" >&2; exit 1 ;;
+              esac
+            fi
+            if [ -z "$_drill_list" ]; then
+              printf 'The snapshot %s holds no copy of any part, so nothing was changed.\n' "$_drill_id" >&2
+              exit 1
+            fi
+            _drill_version="$(sed -n 's/.*"version":"sha256:\([0-9a-f]\{12\}\).*/\1/p' .snapshots/"$_drill_id"/about.json)"
+            _drill_size="$(du -sk .snapshots/"$_drill_id" | cut -f 1)"
+            if ! df -Pk . | awk -v s="$_drill_size" 'NR == 2 { m = $2 / 10; if (m < 1048576) m = 1048576; exit !($4 >= s + m) }'; then drill_skip disk; fi
+            _drill_need=512
+            for _drill_p in $_drill_list; do _drill_need=$((_drill_need + $(drill_memory "$_drill_p"))); done
+            _drill_free=""
+            if [ -r /proc/meminfo ]; then _drill_free="$(awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } END { if (a == "") a = f; if (a != "") print int(a / 1024) }' /proc/meminfo)"; fi
+            if [ -n "$_drill_free" ] && [ "$_drill_free" -lt "$_drill_need" ]; then drill_skip memory; fi
+            _drill_dir=.drill/"$_drill_id"
+            trap 'drill_finish failed stopped' HUP INT TERM
+            mkdir -p "$_drill_dir" || drill_finish failed files
+            _drill_image=""
+            if [ "$_drill_kind" = scheduled ]; then
+              _drill_hex="$(sed -n 's/.*"version":"sha256:\([0-9a-f]\{64\}\)".*/\1/p' .snapshots/"$_drill_id"/about.json)"
+              [ -n "$_drill_hex" ] || drill_finish failed version
+              cp -Rp .drill-recipe/. "$_drill_dir"/ || drill_finish failed files
+              rm -f "$_drill_dir"/schedule
+              chmod 700 "$_drill_dir" || drill_finish failed files
+              for _drill_f in "$_drill_dir"/*.env; do if [ -f "$_drill_f" ]; then chmod 600 "$_drill_f" || drill_finish failed files; fi; done
+              [ -f "$_drill_dir"/compose.yaml ] || drill_finish failed files
+              _drill_image="$(sed -n 's|^ *image: *\(ghcr\.io/[a-z0-9._/-]*\)@sha256:0\{64\}$|\1|p' "$_drill_dir"/compose.yaml | head -n 1)"
+              [ -n "$_drill_image" ] || drill_finish failed files
+              _drill_image="$_drill_image@sha256:$_drill_hex"
+              { sed "s|@sha256:0\{64\}\$|@sha256:$_drill_hex|" "$_drill_dir"/compose.yaml > "$_drill_dir"/compose.yaml.new && mv -f "$_drill_dir"/compose.yaml.new "$_drill_dir"/compose.yaml; } || drill_finish failed files
+            else
+              while IFS=' ' read -r _drill_what _drill_a _drill_b; do
+                case "$_drill_what" in
+                  image) _drill_image="$_drill_a" ;;
+                  file)
+                    case "$_drill_a" in "" | /* | *..* | *[!A-Za-z0-9._/-]*) drill_finish failed files ;; esac
+                    case "$_drill_a" in */*) mkdir -p "$_drill_dir"/"${_drill_a%/*}" || drill_finish failed files ;; esac
+                    _drill_mode=022; case "$_drill_a" in *.env) _drill_mode=077 ;; esac
+                    (umask "$_drill_mode" && printf '%s' "$_drill_b" | base64 -d > "$_drill_dir"/"$_drill_a") || drill_finish failed files ;;
+                  "") ;;
+                  *) drill_finish failed files ;;
+                esac
+              done
+            fi
+            [ -f "$_drill_dir"/compose.yaml ] || drill_finish failed files
+            case "$_drill_image" in
+              ghcr.io/*@sha256:*) ;;
+              *) drill_finish failed files ;;
+            esac
+            case "${_drill_image#ghcr.io/}" in *[!a-z0-9._/@:-]*) drill_finish failed files ;; esac
+            (
+              : > .drill/.secrets.env
+              : > .drill/.fill.sed
+              for placeholder in $(grep -rhoE '@SECRET:[A-Za-z][A-Za-z0-9_-]*:(hex32|hex64|b64k32|gk)@' "$_drill_dir" | sort -u); do
+                rest="${placeholder#@SECRET:}"
+                name="${rest%%:*}"
+                format="${rest#*:}"
+                value="$(sed -n "s/^$name=//p" .drill/.secrets.env | head -n 1)"
+                if [ -z "$value" ]; then
+                  value="$(generate "${format%@}")"
+                  printf '%s=%s\n' "$name" "$value" >> .drill/.secrets.env
+                fi
+                printf 's|%s|%s|g\n' "$placeholder" "$value" >> .drill/.fill.sed
+              done
+            ) || drill_finish failed files
+            for _drill_f in $(grep -rlE '@SECRET:[A-Za-z][A-Za-z0-9_-]*:(hex32|hex64|b64k32|gk)@' "$_drill_dir" || true); do
+              { sed -f .drill/.fill.sed "$_drill_f" > "$_drill_f.new" && mv -f "$_drill_f.new" "$_drill_f"; } || drill_finish failed files
+            done
+            rm -f .drill/.secrets.env .drill/.fill.sed
+            (
+              _drill_sleep=""
+              trap 'kill "$_drill_sleep" 2> /dev/null; exit 0' TERM
+              sleep 1800 &
+              _drill_sleep=$!
+              wait "$_drill_sleep" || exit 0
+              : > .drill/.timed-out
+              drill_kill
+            ) < /dev/null > /dev/null 2>&1 &
+            _drill_watch=$!
+            if ! docker image inspect "$_drill_image" > /dev/null 2>&1; then
+              case "$_drill_image" in
+                *@sha256:*) docker pull "$_drill_image" >> "$_drill_dir"/restore.log 2>&1 || drill_finish failed gone ;;
+                *) drill_finish failed gone ;;
+              esac
+            fi
+            docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml create >> "$_drill_dir"/restore.log 2>&1 || drill_finish failed start
+            drill_cut_off || drill_finish failed network
+            _drill_up=""
+            for _drill_p in $_drill_list; do
+              case " mysql " in *" $_drill_p "*) _drill_up="$_drill_up $_drill_p" ;; esac
+            done
+            if [ -n "$_drill_up" ]; then docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml up -d --no-deps --wait $_drill_up >> "$_drill_dir"/restore.log 2>&1 || drill_finish failed start; fi
+            drill_cut_off || drill_finish failed network
+            SNAPSHOT_NO_WAIT=''
+            for _drill_p in $_drill_list; do
+              _drill_t="$(date +%s)"
+              if ! snapshot_restore "$_drill_id" "$_drill_p"; then drill_finish not-restored "$_drill_p"; fi
+              _drill_bytes="$(wc -c < .snapshots/"$_drill_id"/"$(part_file "$_drill_p")" | tr -d ' ')"
+              _drill_parts="${_drill_parts:+$_drill_parts,}$_drill_p:$_drill_bytes:$(( $(date +%s) - _drill_t ))"
+            done
+            _drill_t="$(date +%s)"
+            _drill_state=stopped
+            if docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml up -d --no-deps app >> "$_drill_dir"/restore.log 2>&1; then
+              drill_cut_off || drill_finish failed network
+              _drill_c="$(docker compose -p seocc-drill -f "$_drill_dir"/compose.yaml ps -aq app 2>> "$_drill_dir"/restore.log)" || _drill_c=""
+              if [ "$(docker inspect --format '{{if .State.Health}}yes{{end}}' "$_drill_c" 2> /dev/null || true)" = yes ]; then
+                while :; do
+                  _drill_state="$(docker inspect --format '{{.State.Health.Status}}' "$_drill_c" 2> /dev/null || echo stopped)"
+                  if [ "$_drill_state" = healthy ]; then break; fi
+                  if [ $(( $(date +%s) - _drill_t )) -ge 300 ] || drill_timed_out; then break; fi
+                  sleep 5
+                done
+              else
+                sleep 60
+                _drill_state="$(docker inspect --format '{{.State.Status}}' "$_drill_c" 2> /dev/null || echo stopped)"
+                if [ "$_drill_state" != running ]; then _drill_state=stopped; fi
+              fi
+            fi
+            _drill_health="$_drill_state:$(( $(date +%s) - _drill_t ))"
+            _drill_bad=""
+            for _drill_p in $_drill_list; do
+              case " mysql " in *" $_drill_p "*) ;; *) continue ;; esac
+              _drill_n="$(drill_count "$_drill_p" | tr -d ' \r' | tail -n 1)"
+              case "$_drill_n" in "" | *[!0-9]*) _drill_n=failed ;; esac
+              _drill_tables="${_drill_tables:+$_drill_tables,}$_drill_p:$_drill_n"
+              case "$_drill_n" in failed | 0) _drill_bad="${_drill_bad:-$_drill_p}" ;; esac
+            done
+            if [ -n "$_drill_bad" ]; then drill_finish not-restored "$_drill_bad"; fi
+            case "$_drill_state" in healthy | running) drill_finish healthy ;; esac
+            drill_finish unhealthy
+          )
           if [ "${OPSCREW_SNAPSHOT_FUNCTIONS:-}" = 1 ]; then return 0; fi
           case "${1:-}" in
             list)
@@ -795,6 +1177,9 @@ jobs:
             offsite)
               [ "$#" -eq 2 ] || { snapshot_usage; exit 1; }
               snapshot_id "$2" ;;
+            drill)
+              shift
+              snapshot_cmd_drill "$@" ;;
             take | restore | delete | hold | resume)
               exec 7> .start.lock
               flock 7
@@ -840,7 +1225,8 @@ jobs:
           if [[ -n "$previous" && ! "$previous" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then previous=unknown; fi
           echo "previous=$previous" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$REGISTRY_TOKEN" | ssh "${ssh_opts[@]}" "deploy@${HOST}" "DOCKER_CONFIG=/srv/apps/seocc/.docker docker login ghcr.io -u '${GITHUB_ACTOR}' --password-stdin"
-          ssh "${ssh_opts[@]}" "deploy@${HOST}" sh -s -- "$IMAGE" "$MODE" <<'REMOTE'
+          {
+            ssh "${ssh_opts[@]}" "deploy@${HOST}" sh -s -- "$IMAGE" "$MODE" <<'REMOTE'
           APPS_DIR="${OPSCREW_APPS_DIR:-/srv/apps}"
           EDGE_DIR="${OPSCREW_EDGE_DIR:-/srv/edge}"
           set -eu
@@ -850,6 +1236,10 @@ jobs:
           exec 7> .start.lock
           flock 7
           if [ -f .snapshots/.held ]; then held="held $(cat .snapshots/.held)"; case "$held" in "held rotation "*) printf '::error::OpsCrew changed nothing on the server: a credential rotation holds the app (the rotation of the plan %s), so its services may have new values the app does not use yet: finish the rotation with opscrew rotate, or put the old values back with opscrew rotate --undo, then try again.\n' "${held#held rotation }" ;; *) printf '::error::OpsCrew changed nothing on the server: a restore holds the app (.snapshots/.held in its folder), so its data may be partly restored: finish the restore with opscrew restore <copy>, or run sh snapshot.sh resume in the app'\''s folder as the deploy user, then try again.\n' ;; esac >&2; exit 1; fi
+          if [ "${2:-}" = rollback ] && [ -f .move.waiting ] && [ "$(cat .move.waiting)" != copied ]; then
+            echo '::error::A move to this server waits for the app'\''s data (opscrew retarget), so the app never ran here and there is no version to roll back to. Nothing was changed. Roll back on the server the app moves from, or abort the move first.'
+            exit 1
+          fi
           echo started > .start.outcome
           export APP_IMAGE="$1"
           RUN_IMAGE="$1"
@@ -945,6 +1335,14 @@ jobs:
             rm -f "$EDGE_DIR"/tls/seocc/origin.pem.previous "$EDGE_DIR"/tls/seocc/origin.key.previous "$EDGE_DIR"/tls/seocc/pull.pem.previous
           ) 9> "$EDGE_DIR"/.lock
           docker compose up -d --no-deps --wait mysql
+          if [ "$MODE" = deploy ] && [ -f .move.waiting ] && [ "$(cat .move.waiting)" != copied ]; then
+            docker compose up --no-start --no-deps app
+            printf 'APP_IMAGE=%s\n' "$APP_IMAGE" > .env
+            echo "waiting $APP_IMAGE" > .start.outcome
+            echo '::notice::A move to this server copies the app'\''s data here first (opscrew retarget), so this deploy pulled the image and started only the app'\''s services. The release command, the app, its workers and cron start after the copy.'
+            exit 0
+          fi
+          if [ "$MODE" = deploy ] && [ -f .move.waiting ]; then echo '::notice::A move to this server copied the app'\''s data here (opscrew retarget), so this deploy starts the app on it. opscrew retarget checks the app on this server: its domain still leads to the server the app moves from.'; fi
           if crontab -l 2> /dev/null | grep -q ' # opscrew-snapshots seocc$'; then crontab -l | grep -v ' # opscrew-snapshots seocc$' | crontab -; fi
           if [ "$MODE" = deploy ] && [ -n "$running" ] && [ "$running" != "$target" ]; then
             OPSCREW_SNAPSHOT_FUNCTIONS=1 . ./snapshot.sh
@@ -1071,8 +1469,12 @@ jobs:
           done
           echo finished > .start.outcome
           REMOTE
+          } | tee "$RUNNER_TEMP/opscrew-start.out"
+          if grep -qxF '::notice::A move to this server copies the app'\''s data here first (opscrew retarget), so this deploy pulled the image and started only the app'\''s services. The release command, the app, its workers and cron start after the copy.' "$RUNNER_TEMP/opscrew-start.out"; then echo "waiting=true" >> "$GITHUB_OUTPUT"; fi
+          if grep -qxF '::notice::A move to this server copied the app'\''s data here (opscrew retarget), so this deploy starts the app on it. opscrew retarget checks the app on this server: its domain still leads to the server the app moves from.' "$RUNNER_TEMP/opscrew-start.out"; then echo "moved=true" >> "$GITHUB_OUTPUT"; fi
       - id: health
         name: Check that the app is healthy
+        if: steps.start.outputs.waiting != 'true' && steps.start.outputs.moved != 'true'
         env:
           URL: https://seocc.opscrew.dev/
         run: |
