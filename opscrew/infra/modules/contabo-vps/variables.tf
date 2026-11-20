@@ -1,26 +1,25 @@
 variable "name" {
-  description = "Server name; also prefixes the firewall and SSH key names."
+  description = "Server name (its display name in the Customer Control Panel); also prefixes the firewall and SSH key names."
   type        = string
 }
 
 variable "location" {
-  description = "Hetzner Cloud location, for example nbg1."
+  description = "Contabo region, for example EU."
   type        = string
 }
 
 variable "server_type" {
-  description = "Hetzner Cloud server type, for example cx23."
+  description = "Contabo product id of the plan, for example V153 (Cloud VPS 4)."
   type        = string
 }
 
 variable "image" {
-  description = "Operating system image."
+  description = "Id of the operating system image at Contabo (Ubuntu 24.04)."
   type        = string
-  default     = "ubuntu-24.04"
 }
 
 variable "backups" {
-  description = "Enable Hetzner automated backups (they cost extra; `opscrew design` shows the price)."
+  description = "Whether Contabo's Auto Backup is on (a paid add-on, priced on Contabo's order page). OpsCrew's Contabo connector turns it on after the apply; only the Customer Control Panel turns it off."
   type        = bool
   default     = false
 }
@@ -48,16 +47,15 @@ variable "http_allowed_cidrs" {
   default     = ["0.0.0.0/0", "::/0"]
 }
 
-variable "delete_protection" {
-  description = "Protect the server against accidental deletion and rebuilds."
-  type        = bool
-  default     = true
+variable "app_tag" {
+  description = "The app's own tag, for example opscrew-app:shop, assigned to the server; OpsCrew finds the app's servers by it."
+  type        = string
 }
 
-variable "labels" {
-  description = "Labels added to every resource."
-  type        = map(string)
-  default     = {}
+variable "app_tag_id" {
+  description = "Id of the app's tag when another server of the app or the root module already holds it; null creates the tag here."
+  type        = string
+  default     = null
 }
 
 variable "web" {
@@ -73,7 +71,7 @@ variable "wireguard_port" {
 }
 
 variable "ssh_key_id" {
-  description = "Id of the deploy key when another server of the app already holds it (Hetzner refuses the same key twice); null creates the key here."
+  description = "Id of the deploy key when another server of the app already holds it (one key serves all of them); null creates the key here."
   type        = string
   default     = null
 }

@@ -1,4 +1,5 @@
 resource "cloudflare_dns_record" "a" {
+  count   = var.ipv4_record ? 1 : 0
   zone_id = var.zone_id
   name    = var.domain
   type    = "A"
