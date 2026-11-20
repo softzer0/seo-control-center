@@ -126,9 +126,64 @@ cost:
     currency: EUR
   breakdown:
     - item: Server V153 (EU)
+      provider: contabo
       monthly:
         amount: 5.5
         currency: EUR
+      billing: monthly
+      since: 2026-11-20T13:17:00.000Z
+  oneTime:
+    - item: Setup fee (V153)
+      provider: contabo
+      price:
+        amount: 2
+        currency: EUR
+      at: 2026-11-20T13:17:00.000Z
+  ended:
+    - item: Server cx23 (nbg1)
+      provider: hetzner
+      monthly:
+        amount: 5.49
+        currency: EUR
+      billing: hourly
+      hourly:
+        amount: 0.0088
+        currency: EUR
+      since: 2026-11-08T07:17:29.000Z
+      until: 2026-11-20T14:42:19.000Z
+    - item: Primary IPv4 address
+      provider: hetzner
+      monthly:
+        amount: 0.5
+        currency: EUR
+      billing: hourly
+      hourly:
+        amount: 0.0008
+        currency: EUR
+      since: 2026-11-08T07:17:29.000Z
+      until: 2026-11-20T14:42:19.000Z
+    - item: Automated backups (20% of the server price)
+      provider: hetzner
+      monthly:
+        amount: 1.1
+        currency: EUR
+      billing: hourly
+      hourly:
+        amount: 0.00176
+        currency: EUR
+      since: 2026-11-08T07:17:29.000Z
+      until: 2026-11-19T15:27:14.000Z
+    - item: Snapshot 458743516 (4.6 GB)
+      provider: hetzner
+      monthly:
+        amount: 0.07
+        currency: EUR
+      billing: hourly
+      hourly:
+        amount: 0.000105
+        currency: EUR
+      since: 2026-11-20T14:38:00.000Z
+      until: 2026-11-20T14:55:00.000Z
   pricesIncludeVat: false
   source: static
   asOf: 2026-11-11T00:00:00.000Z
