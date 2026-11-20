@@ -7,12 +7,12 @@ variable "app_name" {
 }
 
 variable "location" {
-  description = "Hetzner Cloud location."
+  description = "Contabo region."
   type        = string
 }
 
 variable "server_type" {
-  description = "Hetzner Cloud server type."
+  description = "Contabo product id of the plan."
   type        = string
 }
 
@@ -22,14 +22,8 @@ variable "image" {
 }
 
 variable "backups" {
-  description = "Hetzner automated backups."
+  description = "Contabo's Auto Backup (priced on Contabo's order page), which OpsCrew turns on after the apply; only the Customer Control Panel turns it off."
   type        = bool
-}
-
-variable "delete_protection" {
-  description = "Protect the server against accidental deletion and rebuilds; `opscrew destroy` passes false."
-  type        = bool
-  default     = true
 }
 
 variable "deploy_ssh_public_key" {

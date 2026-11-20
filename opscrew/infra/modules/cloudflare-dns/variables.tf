@@ -9,14 +9,21 @@ variable "domain" {
 }
 
 variable "ipv4" {
-  description = "Public IPv4 address of the server."
+  description = "Public IPv4 address of the server; null when the module makes no A record (ipv4_record false)."
   type        = string
+  default     = null
 }
 
 variable "ipv6" {
   description = "Public IPv6 address of the server; null when it has none (then set ipv6_record to false)."
   type        = string
   default     = null
+}
+
+variable "ipv4_record" {
+  description = "Create the A record. False for a server at home, whose address updater keeps the A and AAAA records itself."
+  type        = bool
+  default     = true
 }
 
 variable "ipv6_record" {

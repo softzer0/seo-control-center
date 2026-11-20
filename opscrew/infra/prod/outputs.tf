@@ -25,10 +25,32 @@ output "url" {
 # replaced from the new one by their providers.
 output "servers" {
   value = {
-    hetzner = {
+    contabo = {
       ipv4 = module.server.ipv4_address
       ipv6 = module.server.ipv6_address
       id   = module.server.server_id
+    }
+  }
+}
+
+# The firewall of each server whose provider's Terraform cannot manage it, by module: OpsCrew
+# makes it through the provider's API after every apply.
+output "wanted_firewalls" {
+  value = {
+    server = {
+      provider = "contabo"
+      firewall = module.server.wanted_firewall
+    }
+  }
+}
+
+# The automated backups of each server whose provider's Terraform cannot turn them on, by
+# module: OpsCrew turns them on through the provider's API after the apply.
+output "wanted_backups" {
+  value = {
+    server = {
+      provider = "contabo"
+      backup   = module.server.wanted_backup
     }
   }
 }
